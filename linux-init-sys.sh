@@ -1157,7 +1157,7 @@ configure_user_environment() {
 
 # Custom aliases - debian12-setup
 # LS aliases
-alias ll='ls -alh --color=auto'
+alias ll='ls -lh --color=auto'
 alias la='ls -A --color=auto'
 alias l='ls -CF --color=auto'
 alias ls='ls --color=auto'
