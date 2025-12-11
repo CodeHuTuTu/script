@@ -1,1527 +1,1426 @@
 #!/bin/bash
 
-#===============================================================================
-# Debian 12 系统初始化配置脚本
-# 功能：系统更新、Docker安装、用户管理、SSH配置、安全加固等
-# bash <(curl -fsSL )
-#===============================================================================
+# Linux系统初始化脚本
+# 适用于Ubuntu/Debian/CentOS/RHEL系统
+# 作者: CodeHuTuTu
+# 版本: 2.0
 
-set -e  # 遇到错误立即退出
+set -euo pipefail
 
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-# 日志函数
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+# 日志文件
+LOG_FILE="/var/log/system_init.log"
+
+# 获取操作系统信息
+get_os_info() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$NAME
+        VER=$VERSION_ID
+    elif type lsb_release >/dev/null 2>&1; then
+        OS=$(lsb_release -si)
+        VER=$(lsb_release -sr)
+    elif [ -f /etc/lsb-release ]; then
+        . /etc/lsb-release
+        OS=$DISTRIB_ID
+        VER=$DISTRIB_RELEASE
+    elif [ -f /etc/debian_version ]; then
+        OS=Debian
+        VER=$(cat /etc/debian_version)
+    elif [ -f /etc/redhat-release ]; then
+        OS=CentOS
+        VER=$(rpm -q --qf "%{VERSION}" $(rpm -q --whatprovides redhat-release))
+    else
+        OS=$(uname -s)
+        VER=$(uname -r)
+    fi
+    
+    echo "检测到操作系统: $OS $VER"
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+# 检测包管理器
+detect_package_manager() {
+    if command -v apt-get > /dev/null; then
+        PKG_MANAGER="apt-get"
+        UPDATE_CMD="apt-get update"
+        INSTALL_CMD="apt-get install -y"
+    elif command -v yum > /dev/null; then
+        PKG_MANAGER="yum"
+        UPDATE_CMD="yum update -y"
+        INSTALL_CMD="yum install -y"
+    elif command -v dnf > /dev/null; then
+        PKG_MANAGER="dnf"
+        UPDATE_CMD="dnf update -y"
+        INSTALL_CMD="dnf install -y"
+    else
+        echo -e "${RED}错误: 未找到支持的包管理器${NC}"
+        exit 1
+    fi
+    
+    echo "使用包管理器: $PKG_MANAGER"
 }
 
-log_error() {
+# 日志记录函数
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+}
+
+# 打印带颜色的信息
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+    log "[INFO] $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log "[SUCCESS] $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+    log "[WARNING] $1"
+}
+
+print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+    log "[ERROR] $1"
 }
 
-log_step() {
-    echo -e "\n${BLUE}==== $1 ====${NC}\n"
-}
-
-# 检查是否为 root 用户
+# 检查是否为root用户
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "此脚本需要 root 权限运行"
-        echo "请使用: sudo bash $0"
+        print_error "此脚本需要root权限运行"
         exit 1
     fi
 }
 
-# 确认提示
-confirm() {
-    local prompt="$1"
-    local default="${2:-n}"
-
-    if [[ $default == "y" ]]; then
-        prompt="$prompt [Y/n]: "
-    else
-        prompt="$prompt [y/N]: "
-    fi
-
-    read -p "$prompt" response
-    response=${response:-$default}
-
-    if [[ "$response" =~ ^[Yy]$ ]]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-#===============================================================================
-# 1. 系统更新
-#===============================================================================
-update_system() {
-    log_step "系统更新"
-
-    log_info "更新软件包列表..."
-    apt update
-
-    log_info "升级已安装的软件包..."
-    apt upgrade -y
-
-    log_info "升级系统（包括内核）..."
-    apt full-upgrade -y
-
-    log_info "清理不需要的软件包..."
-    apt autoremove -y
-    apt autoclean
-
-    log_info "系统更新完成！"
-}
-
-#===============================================================================
-# 2. 安装 Docker（官方源）
-#===============================================================================
-install_docker() {
-    log_step "安装 Docker"
-
-    # 检查是否已安装
-    if command -v docker &> /dev/null; then
-        local version=$(docker --version)
-        log_warn "Docker 已安装: $version"
-        if ! confirm "是否重新安装？"; then
-            return
-        fi
-    fi
-
-    log_info "安装依赖包..."
-    apt install -y \
-        ca-certificates \
-        curl \
-        gnupg \
-        lsb-release
-
-    log_info "添加 Docker 官方 GPG 密钥..."
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-
-    log_info "添加 Docker 官方软件源..."
-    echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-        $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    log_info "更新软件包列表..."
-    apt update
-
-    log_info "安装 Docker Engine, containerd 和 Docker Compose..."
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-    log_info "启动并启用 Docker 服务..."
-    systemctl start docker
-    systemctl enable docker
-
-    log_info "验证 Docker 安装..."
-    docker --version
-    docker compose version
-
-    log_info "Docker 安装完成！"
-}
-
-#===============================================================================
-# 3. 新建用户
-#===============================================================================
-create_user() {
-    log_step "新建用户"
-
-    read -p "请输入新用户名: " username
-
-    if [[ -z "$username" ]]; then
-        log_error "用户名不能为空"
-        return 1
-    fi
-
-    # 检查用户是否已存在
-    if id "$username" &>/dev/null; then
-        log_warn "用户 $username 已存在"
-        return 1
-    fi
-
-    log_info "创建用户 $username..."
-    useradd -m -s /bin/bash "$username"
-
-    log_info "设置用户密码..."
-    passwd "$username"
-
-    # 询问是否添加 sudo 权限
-    if confirm "是否为用户 $username 添加 sudo 权限？" "y"; then
-        usermod -aG sudo "$username"
-        log_info "已将用户添加到 sudo 组"
-    fi
-
-    # 询问是否添加到 docker 组
-    if command -v docker &> /dev/null; then
-        if confirm "是否允许用户 $username 使用 Docker（无需 sudo）？"; then
-            usermod -aG docker "$username"
-            log_info "已将用户添加到 docker 组"
-        fi
-    fi
-
-    log_info "用户 $username 创建完成！"
-}
-
-#===============================================================================
-# 4. 添加 SSH 密钥
-#===============================================================================
-add_ssh_key() {
-    log_step "添加 SSH 密钥"
-
-    read -p "请输入用户名（为该用户添加 SSH 密钥）: " username
-
-    if [[ -z "$username" ]]; then
-        log_error "用户名不能为空"
-        return 1
-    fi
-
-    if ! id "$username" &>/dev/null; then
-        log_error "用户 $username 不存在"
-        return 1
-    fi
-
-    local user_home=$(eval echo ~$username)
-    local ssh_dir="$user_home/.ssh"
-    local auth_keys="$ssh_dir/authorized_keys"
-
-    log_info "为用户 $username 配置 SSH 密钥..."
-
-    # 创建 .ssh 目录
-    if [[ ! -d "$ssh_dir" ]]; then
-        mkdir -p "$ssh_dir"
-        log_info "已创建目录: $ssh_dir"
-    fi
-
-    # 获取公钥
-    echo -e "\n${YELLOW}请粘贴 SSH 公钥内容（粘贴后按 Enter，然后输入 END 或 end 并按 Enter 结束）:${NC}"
-    echo "----------------------------------------"
-
-    local pubkey=""
-    local line
-    while IFS= read -r line; do
-        # 忽略大小写比较
-        if [[ "${line,,}" == "end" ]]; then
-            break
-        fi
-        pubkey+="$line"$'\n'
-    done
-
-    if [[ -z "$pubkey" ]]; then
-        log_error "未输入公钥内容"
-        return 1
-    fi
-
-    # 添加公钥到 authorized_keys
-    echo "$pubkey" >> "$auth_keys"
-
-    # 设置正确的权限
-    chown -R "$username:$username" "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    chmod 600 "$auth_keys"
-
-    log_info "权限设置："
-    echo "  $ssh_dir: 700"
-    echo "  $auth_keys: 600"
-    echo "  所有者: $username:$username"
-
-    log_info "SSH 密钥添加完成！"
-
-    # 显示 authorized_keys 的密钥数量
-    local key_count=$(grep -c "ssh-" "$auth_keys" 2>/dev/null || echo "0")
-    log_info "当前 authorized_keys 中有 $key_count 个密钥"
-}
-
-#===============================================================================
-# 5. 安装常用工具
-#===============================================================================
-install_common_tools() {
-    log_step "安装常用工具"
-
-    local tools=(
-        "vim"           # 文本编辑器
-        "git"           # 版本控制
-        "curl"          # HTTP 工具
-        "wget"          # 下载工具
-        "htop"          # 进程查看
-        "net-tools"     # 网络工具（ifconfig等）
-        "tree"          # 目录树显示
-        "unzip"         # 解压工具
-        "zip"           # 压缩工具
-        "tmux"          # 终端复用
-        "ncdu"          # 磁盘使用分析
-        "iotop"         # IO 监控
-        "sysstat"       # 系统性能工具
-        "lsof"          # 查看打开的文件
-        "dnsutils"      # DNS 工具（dig, nslookup）
-        "tcpdump"       # 网络抓包
-    )
-
-    log_info "将安装以下工具："
-    for tool in "${tools[@]}"; do
-        echo "  - $tool"
-    done
-
-    if ! confirm "确认安装？" "y"; then
-        return
-    fi
-
-    log_info "开始安装..."
-    apt install -y "${tools[@]}"
-
-    log_info "常用工具安装完成！"
-}
-
-#===============================================================================
-# 6. 配置时区
-#===============================================================================
-configure_timezone() {
-    log_step "配置时区"
-
-    local timezone="Asia/Shanghai"
-    local current_tz=$(timedatectl show -p Timezone --value)
-
-    log_info "当前时区: $current_tz"
-    log_info "将设置为: $timezone"
-
-    if ! confirm "确认修改时区？" "y"; then
-        return
-    fi
-
-    timedatectl set-timezone "$timezone"
-
-    log_info "时区设置完成！"
-    log_info "当前时间: $(date)"
-}
-
-#===============================================================================
-# 7. 配置 UFW 防火墙
-#===============================================================================
-configure_ufw() {
-    log_step "配置 UFW 防火墙"
-
-    # 安装 UFW
-    if ! command -v ufw &> /dev/null; then
-        log_info "安装 UFW..."
-        apt install -y ufw
-    fi
-
-    log_warn "配置防火墙前请确保至少开放一个 SSH 端口，否则可能失去连接！"
-
-    # 获取当前 SSH 端口
-    local current_ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    current_ssh_port=${current_ssh_port:-22}
-
-    log_info "当前 SSH 端口: $current_ssh_port"
-
-    read -p "请输入要开放的 SSH 端口 [默认: $current_ssh_port]: " ssh_port
-    ssh_port=${ssh_port:-$current_ssh_port}
-
-    log_info "配置防火墙规则..."
-
-    # 默认策略
-    ufw default deny incoming
-    ufw default allow outgoing
-
-    # 开放 SSH 端口
-    log_info "开放 SSH 端口: $ssh_port"
-    ufw allow "$ssh_port/tcp" comment 'SSH'
-
-    # 询问是否开放 HTTP/HTTPS
-    if confirm "是否开放 HTTP (80) 和 HTTPS (443) 端口？"; then
-        ufw allow 80/tcp comment 'HTTP'
-        ufw allow 443/tcp comment 'HTTPS'
-        log_info "已开放 HTTP 和 HTTPS 端口"
-    fi
-
-    # 询问是否开放自定义端口
-    if confirm "是否需要开放其他端口？"; then
-        while true; do
-            read -p "请输入端口号（格式: 8080/tcp 或 8080，留空结束）: " custom_port
-            if [[ -z "$custom_port" ]]; then
-                break
-            fi
-
-            # 如果没有指定协议，默认使用 tcp
-            if [[ ! "$custom_port" =~ / ]]; then
-                custom_port="$custom_port/tcp"
-            fi
-
-            read -p "请输入备注（可选）: " comment
-            if [[ -n "$comment" ]]; then
-                ufw allow "$custom_port" comment "$comment"
-            else
-                ufw allow "$custom_port"
-            fi
-            log_info "已添加规则: $custom_port"
-        done
-    fi
-
-    # 显示规则
-    log_info "当前防火墙规则："
-    ufw show added
-
-    if confirm "确认启用防火墙？" "y"; then
-        # 启用防火墙（使用 --force 避免交互提示）
-        echo "y" | ufw enable
-        log_info "防火墙已启用！"
-
-        # 显示状态
-        ufw status verbose
-    else
-        log_warn "已取消启用防火墙"
-    fi
-}
-
-#===============================================================================
-# 8. 修改 SSH 配置（安全加固）
-#===============================================================================
-configure_ssh() {
-    log_step "配置 SSH 安全设置"
-
-    local ssh_config="/etc/ssh/sshd_config"
-    local ssh_config_backup="${ssh_config}.backup.$(date +%Y%m%d_%H%M%S)"
-
-    log_warn "⚠️  重要提示 ⚠️"
-    log_warn "修改 SSH 配置可能导致无法连接服务器！"
-    log_warn "请确保："
-    log_warn "  1. 已经添加了 SSH 密钥（如果要禁用密码登录）"
-    log_warn "  2. 当前 SSH 连接保持打开"
-    log_warn "  3. 有其他方式访问服务器（如控制台）"
-    echo ""
-
-    if ! confirm "是否继续配置 SSH？"; then
-        return
-    fi
-
+# 备份重要配置文件
+backup_configs() {
+    print_info "备份重要配置文件..."
+    
+    BACKUP_DIR="/root/config_backup_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    
     # 备份配置文件
-    log_info "备份 SSH 配置到: $ssh_config_backup"
-    cp "$ssh_config" "$ssh_config_backup"
-
-    # 修改 SSH 端口
-    local new_ssh_port=""
-    local old_ssh_port=$(grep "^Port " "$ssh_config" 2>/dev/null | awk '{print $2}')
-    old_ssh_port=${old_ssh_port:-22}
-
-    if confirm "是否修改 SSH 端口（默认 22）？"; then
-        log_info "当前 SSH 端口: $old_ssh_port"
-        read -p "请输入新的 SSH 端口号 [建议: 2222-65535]: " new_ssh_port
-
-        if [[ -n "$new_ssh_port" ]] && [[ "$new_ssh_port" =~ ^[0-9]+$ ]]; then
-            # 验证端口号范围
-            if [ "$new_ssh_port" -lt 1 ] || [ "$new_ssh_port" -gt 65535 ]; then
-                log_error "端口号必须在 1-65535 之间"
-                return 1
-            fi
-
-            # 检查端口是否已被占用
-            if ss -tuln | grep -q ":$new_ssh_port "; then
-                log_warn "端口 $new_ssh_port 可能已被其他服务占用"
-                if ! confirm "是否仍要继续？"; then
-                    return 1
-                fi
-            fi
-
-            # UFW 防火墙集成
-            local ufw_enabled=false
-            if command -v ufw &> /dev/null; then
-                if ufw status | grep -q "Status: active"; then
-                    ufw_enabled=true
-                    log_info "检测到 UFW 防火墙已启用"
-
-                    # 添加新端口
-                    log_info "在 UFW 中开放新 SSH 端口 $new_ssh_port..."
-                    ufw allow "$new_ssh_port/tcp" comment 'SSH'
-                    log_info "✓ 已在 UFW 中开放端口 $new_ssh_port"
-
-                    # 显示当前 SSH 相关规则
-                    echo ""
-                    log_info "当前 SSH 相关的防火墙规则："
-                    ufw status numbered | grep -E "SSH|$old_ssh_port|$new_ssh_port" | sed 's/^/  /'
-
-                    # 询问是否删除旧端口规则
-                    if [ "$old_ssh_port" != "$new_ssh_port" ]; then
-                        echo ""
-                        log_warn "检测到旧 SSH 端口: $old_ssh_port"
-                        if confirm "是否从 UFW 中删除旧的 SSH 端口 $old_ssh_port 规则？"; then
-                            # 查找并删除旧端口规则
-                            local rule_deleted=false
-                            # 尝试删除包含旧端口的规则
-                            if ufw status | grep -q "$old_ssh_port/tcp"; then
-                                ufw delete allow "$old_ssh_port/tcp" 2>/dev/null && rule_deleted=true
-                            fi
-
-                            if [ "$rule_deleted" = true ]; then
-                                log_info "✓ 已删除旧端口 $old_ssh_port 的防火墙规则"
-                            else
-                                log_warn "未找到端口 $old_ssh_port 的规则，或删除失败"
-                            fi
-                        else
-                            log_info "保留旧端口 $old_ssh_port 的防火墙规则（双端口可用）"
-                        fi
-                    fi
-
-                    echo ""
-                    log_info "更新后的 UFW 规则："
-                    ufw status | sed 's/^/  /'
-                fi
-            fi
-
-            # 修改 SSH 配置端口
-            if grep -q "^Port " "$ssh_config"; then
-                sed -i "s/^Port .*/Port $new_ssh_port/" "$ssh_config"
-            else
-                echo "Port $new_ssh_port" >> "$ssh_config"
-            fi
-            log_info "✓ 已在 SSH 配置中设置端口为: $new_ssh_port"
-
-            # 特别提示
-            if [ "$ufw_enabled" = false ] && command -v ufw &> /dev/null; then
-                log_warn "UFW 已安装但未启用，端口修改后请记得配置防火墙"
-            fi
-        else
-            log_error "无效的端口号"
-            return 1
+    files_to_backup=(
+        "/etc/ssh/sshd_config"
+        "/etc/security/limits.conf"
+        "/etc/sysctl.conf"
+        "/etc/profile"
+        "/etc/hosts"
+        "/etc/fstab"
+    )
+    
+    for file in "${files_to_backup[@]}"; do
+        if [ -f "$file" ]; then
+            cp "$file" "$BACKUP_DIR/"
+            print_success "已备份 $file"
         fi
-    fi
-
-    # 禁用 root 登录
-    if confirm "是否禁用 root 直接登录？" "y"; then
-        sed -i 's/^#*PermitRootLogin .*/PermitRootLogin no/' "$ssh_config"
-        if ! grep -q "^PermitRootLogin" "$ssh_config"; then
-            echo "PermitRootLogin no" >> "$ssh_config"
-        fi
-        log_info "已禁用 root 登录"
-    fi
-
-    # 禁用密码登录
-    if confirm "是否禁用密码登录（仅允许密钥登录）？" "y"; then
-        log_warn "请确保已经添加了 SSH 公钥，否则将无法登录！"
-        if confirm "确认已添加公钥，继续禁用密码登录？"; then
-            sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' "$ssh_config"
-            if ! grep -q "^PasswordAuthentication" "$ssh_config"; then
-                echo "PasswordAuthentication no" >> "$ssh_config"
-            fi
-
-            sed -i 's/^#*PubkeyAuthentication .*/PubkeyAuthentication yes/' "$ssh_config"
-            if ! grep -q "^PubkeyAuthentication" "$ssh_config"; then
-                echo "PubkeyAuthentication yes" >> "$ssh_config"
-            fi
-
-            log_info "已禁用密码登录，仅允许密钥登录"
-        fi
-    fi
-
-    # 其他安全设置
-    if confirm "是否应用其他安全设置（禁用空密码、X11转发等）？" "y"; then
-        # 禁用空密码
-        sed -i 's/^#*PermitEmptyPasswords .*/PermitEmptyPasswords no/' "$ssh_config"
-        if ! grep -q "^PermitEmptyPasswords" "$ssh_config"; then
-            echo "PermitEmptyPasswords no" >> "$ssh_config"
-        fi
-
-        # 禁用 X11 转发
-        sed -i 's/^#*X11Forwarding .*/X11Forwarding no/' "$ssh_config"
-        if ! grep -q "^X11Forwarding" "$ssh_config"; then
-            echo "X11Forwarding no" >> "$ssh_config"
-        fi
-
-        # 设置最大认证尝试次数
-        sed -i 's/^#*MaxAuthTries .*/MaxAuthTries 3/' "$ssh_config"
-        if ! grep -q "^MaxAuthTries" "$ssh_config"; then
-            echo "MaxAuthTries 3" >> "$ssh_config"
-        fi
-
-        log_info "已应用额外安全设置"
-    fi
-
-    # 测试配置文件
-    log_info "测试 SSH 配置文件语法..."
-    if sshd -t; then
-        log_info "✓ SSH 配置文件语法正确"
-    else
-        log_error "✗ SSH 配置文件语法错误！"
-        log_info "恢复备份配置..."
-        cp "$ssh_config_backup" "$ssh_config"
-        return 1
-    fi
-
-    # 显示修改的配置
-    log_info "修改后的关键配置："
-    grep -E "^(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication)" "$ssh_config" | sed 's/^/  /'
-
-    echo ""
-    log_warn "⚠️  重要：重启 SSH 服务前请注意 ⚠️"
-    if [[ -n "$new_ssh_port" ]]; then
-        log_warn "  1. SSH 端口已从 $old_ssh_port 改为: $new_ssh_port"
-        if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-            log_warn "  2. UFW 防火墙已自动配置端口 $new_ssh_port"
-        fi
-        log_warn "  3. 请保持当前连接，开新终端测试新端口"
-        log_warn "  4. 测试命令: ssh -p $new_ssh_port user@server"
-        log_warn "  5. 确认新连接成功后，再关闭当前连接"
-    else
-        log_warn "  1. 确认新连接成功后，再关闭当前连接"
-    fi
-    log_warn "  ⚠️  如果无法连接，使用控制台恢复配置："
-    log_warn "     cp $ssh_config_backup $ssh_config && systemctl restart sshd"
-    echo ""
-
-    if confirm "确认重启 SSH 服务？"; then
-        log_info "重启 SSH 服务..."
-        systemctl restart sshd
-
-        log_info "SSH 服务已重启"
-        log_info "当前 SSH 连接仍然有效，请在新终端测试连接！"
-
-        if [[ -n "$new_ssh_port" ]]; then
-            echo ""
-            log_warn "新的连接命令："
-            echo "  ssh -p $new_ssh_port username@$(hostname -I | awk '{print $1}')"
-        fi
-    else
-        log_warn "已取消重启 SSH 服务"
-        log_info "配置已修改但未生效，需要手动重启: systemctl restart sshd"
-    fi
-}
-
-#===============================================================================
-# 9. 安装配置 Fail2ban
-#===============================================================================
-install_fail2ban() {
-    log_step "安装配置 Fail2ban"
-
-    # 安装 fail2ban
-    if ! command -v fail2ban-client &> /dev/null; then
-        log_info "安装 fail2ban..."
-        apt install -y fail2ban
-    else
-        log_warn "fail2ban 已安装"
-    fi
-
-    log_info "配置 fail2ban..."
-
-    # 创建本地配置文件
-    local jail_local="/etc/fail2ban/jail.local"
-
-    # 获取 SSH 端口（自动同步 SSH 配置）
-    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    ssh_port=${ssh_port:-22}
-    log_info "检测到 SSH 端口: $ssh_port （自动同步）"
-
-    # 检查日志文件路径
-    local log_backend="auto"
-    local log_path=""
-
-    if [[ -f /var/log/auth.log ]]; then
-        log_path="/var/log/auth.log"
-        log_info "使用传统日志文件: $log_path"
-    else
-        # Debian 12 默认使用 systemd journal
-        log_backend="systemd"
-        log_info "使用 systemd journal 作为日志源"
-
-        # 确保 rsyslog 已安装（用于创建传统日志文件）
-        if ! systemctl is-active --quiet rsyslog; then
-            log_warn "rsyslog 未运行，将安装并启用"
-            apt install -y rsyslog
-            systemctl enable rsyslog
-            systemctl start rsyslog
-            # 等待日志文件创建
-            sleep 2
-            if [[ -f /var/log/auth.log ]]; then
-                log_path="/var/log/auth.log"
-                log_backend="auto"
-                log_info "已创建传统日志文件: $log_path"
-            fi
-        fi
-    fi
-
-    log_info "创建 fail2ban 配置: $jail_local"
-
-    if [[ "$log_backend" == "systemd" ]]; then
-        # 使用 systemd backend
-        cat > "$jail_local" << EOF
-[DEFAULT]
-# 封禁时间（秒）：10分钟
-bantime = 600
-
-# 查找时间（秒）：10分钟内
-findtime = 600
-
-# 最大重试次数
-maxretry = 5
-
-# 封禁动作（使用 iptables）
-banaction = iptables-multiport
-
-[sshd]
-enabled = true
-port = $ssh_port
-filter = sshd
-backend = systemd
-maxretry = 3
-bantime = 3600
-findtime = 600
-EOF
-    else
-        # 使用传统日志文件
-        cat > "$jail_local" << EOF
-[DEFAULT]
-# 封禁时间（秒）：10分钟
-bantime = 600
-
-# 查找时间（秒）：10分钟内
-findtime = 600
-
-# 最大重试次数
-maxretry = 5
-
-# 封禁动作（使用 iptables）
-banaction = iptables-multiport
-
-[sshd]
-enabled = true
-port = $ssh_port
-filter = sshd
-logpath = $log_path
-maxretry = 3
-bantime = 3600
-findtime = 600
-EOF
-    fi
-
-    log_info "Fail2ban 配置内容："
-    cat "$jail_local" | sed 's/^/  /'
-
-    if confirm "是否修改封禁参数？"; then
-        read -p "封禁时间（秒，默认 3600=1小时）: " bantime
-        read -p "查找时间（秒，默认 600=10分钟）: " findtime
-        read -p "最大重试次数（默认 3）: " maxretry
-
-        if [[ -n "$bantime" ]]; then
-            sed -i "s/^bantime = .*/bantime = $bantime/" "$jail_local"
-        fi
-        if [[ -n "$findtime" ]]; then
-            sed -i "/\[sshd\]/,/^$/ s/^findtime = .*/findtime = $findtime/" "$jail_local"
-        fi
-        if [[ -n "$maxretry" ]]; then
-            sed -i "/\[sshd\]/,/^$/ s/^maxretry = .*/maxretry = $maxretry/" "$jail_local"
-        fi
-    fi
-
-    # 启动/重启 fail2ban
-    log_info "启动 fail2ban 服务..."
-    systemctl enable fail2ban
-
-    # 如果服务已运行，重启；否则启动
-    if systemctl is-active --quiet fail2ban; then
-        systemctl restart fail2ban
-    else
-        systemctl start fail2ban
-    fi
-
-    # 等待服务完全启动（检查 socket 文件）
-    log_info "等待服务启动..."
-    local max_wait=10
-    local count=0
-    while [ $count -lt $max_wait ]; do
-        if [ -S /var/run/fail2ban/fail2ban.sock ]; then
-            log_info "服务已就绪"
-            break
-        fi
-        sleep 1
-        count=$((count + 1))
     done
-
-    if [ $count -eq $max_wait ]; then
-        log_warn "服务启动超时，请检查服务状态"
-        systemctl status fail2ban --no-pager
-        return 1
-    fi
-
-    # 显示状态
-    log_info "Fail2ban 状态："
-    fail2ban-client status
-
-    log_info "SSH jail 状态："
-    fail2ban-client status sshd 2>/dev/null || log_warn "SSH jail 可能还未完全加载"
-
-    log_info "Fail2ban 安装配置完成！"
-    echo ""
-    log_info "常用命令："
-    echo "  查看状态: fail2ban-client status sshd"
-    echo "  解封 IP:  fail2ban-client set sshd unbanip <IP>"
-    echo "  查看日志: tail -f /var/log/fail2ban.log"
+    
+    print_success "配置文件备份完成，备份目录: $BACKUP_DIR"
 }
 
-#===============================================================================
-# 10. 配置 SSH 登录欢迎信息
-#===============================================================================
-configure_ssh_motd() {
-    log_step "配置 SSH 登录欢迎信息"
-
-    # 检查当前状态
-    local is_enabled=false
-    if [[ -x /etc/update-motd.d/10-header ]] && [[ -x /etc/update-motd.d/20-sysinfo ]]; then
-        is_enabled=true
-    fi
-
-    if [ "$is_enabled" = true ]; then
-        log_info "SSH 登录欢迎信息当前状态: ${GREEN}已启用${NC}"
-        echo ""
-        echo "请选择操作："
-        echo "  1) 禁用欢迎信息"
-        echo "  2) 重新配置"
-        echo "  3) 预览当前效果"
-        echo "  0) 返回"
-        read -p "请选择 [0-3]: " motd_action
-
-        case $motd_action in
-            1)
-                log_info "禁用 SSH 登录欢迎信息..."
-                chmod -x /etc/update-motd.d/10-header 2>/dev/null
-                chmod -x /etc/update-motd.d/20-sysinfo 2>/dev/null
-                chmod -x /etc/update-motd.d/30-users 2>/dev/null
-                chmod -x /etc/update-motd.d/40-updates 2>/dev/null
-                chmod -x /etc/update-motd.d/50-footer 2>/dev/null
-                log_info "已禁用 SSH 登录欢迎信息"
-                return
-                ;;
-            2)
-                log_info "将重新配置 SSH 登录欢迎信息..."
-                ;;
-            3)
-                log_info "当前欢迎信息预览："
-                echo "------------------------------------------------------------"
-                run-parts /etc/update-motd.d/
-                echo "------------------------------------------------------------"
-                return
-                ;;
-            0|*)
-                return
-                ;;
-        esac
-    else
-        log_info "SSH 登录欢迎信息当前状态: ${YELLOW}未启用${NC}"
-        echo ""
-        log_info "将创建动态欢迎信息，显示："
-        echo "  - 系统信息（主机名、内核版本、运行时间）"
-        echo "  - CPU 负载"
-        echo "  - 内存使用情况"
-        echo "  - 磁盘使用情况"
-        echo "  - 当前登录用户"
-        echo "  - 系统更新提示"
-        echo ""
-
-        if ! confirm "是否启用 SSH 登录欢迎信息？" "y"; then
-            return
-        fi
-    fi
-
-    # 确保目录存在
-    mkdir -p /etc/update-motd.d
-
-    # 禁用默认的静态 motd
-    if [[ -f /etc/motd ]]; then
-        mv /etc/motd /etc/motd.bak.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-        log_info "已备份原 /etc/motd"
-    fi
-
-    # 禁用一些默认的 motd 脚本
-    if [[ -d /etc/update-motd.d ]]; then
-        chmod -x /etc/update-motd.d/* 2>/dev/null || true
-    fi
-
-    #---------------------------------------------------------------------------
-    # 创建自定义欢迎信息脚本
-    #---------------------------------------------------------------------------
-    log_info "创建欢迎信息脚本..."
-
-    # 10-header - 系统信息头部
-    cat > /etc/update-motd.d/10-header << 'EOF'
-#!/bin/bash
-
-# 颜色定义
-CYAN='\033[0;36m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-echo -e "${CYAN}"
-echo "╔════════════════════════════════════════════════════════════════╗"
-echo "║                      欢迎登录本服务器                           ║"
-echo "╚════════════════════════════════════════════════════════════════╝"
-echo -e "${NC}"
-
-# 系统信息
-HOSTNAME=$(hostname)
-KERNEL=$(uname -r)
-UPTIME=$(uptime -p | sed 's/up //')
-IP_ADDR=$(hostname -I | awk '{print $1}')
-
-echo -e "${GREEN}主机名称:${NC} $HOSTNAME"
-echo -e "${GREEN}内核版本:${NC} $KERNEL"
-echo -e "${GREEN}运行时间:${NC} $UPTIME"
-echo -e "${GREEN}IP 地址:${NC} $IP_ADDR"
-echo ""
-EOF
-
-    # 20-sysinfo - 系统资源信息
-    cat > /etc/update-motd.d/20-sysinfo << 'EOF'
-#!/bin/bash
-
-# 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-echo "════════════════════════════════════════════════════════════════"
-echo "  系统资源状态"
-echo "════════════════════════════════════════════════════════════════"
-
-# CPU 负载
-LOAD=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
-CPU_CORES=$(nproc)
-echo -e "${GREEN}CPU 核心:${NC} $CPU_CORES"
-echo -e "${GREEN}系统负载:${NC} $LOAD (1min, 5min, 15min)"
-
-# 内存使用
-MEMORY=$(free -h | awk '/^Mem:/ {print $3 "/" $2}')
-MEMORY_PERCENT=$(free | awk '/^Mem:/ {printf "%d", $3/$2*100}')
-if [ "$MEMORY_PERCENT" -gt 80 ]; then
-    MEM_COLOR=$RED
-elif [ "$MEMORY_PERCENT" -gt 60 ]; then
-    MEM_COLOR=$YELLOW
-else
-    MEM_COLOR=$GREEN
-fi
-echo -e "${GREEN}内存使用:${NC} ${MEM_COLOR}$MEMORY ($MEMORY_PERCENT%)${NC}"
-
-# 磁盘使用（根分区）
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2}')
-DISK_PERCENT=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
-if [ "$DISK_PERCENT" -gt 80 ]; then
-    DISK_COLOR=$RED
-elif [ "$DISK_PERCENT" -gt 60 ]; then
-    DISK_COLOR=$YELLOW
-else
-    DISK_COLOR=$GREEN
-fi
-echo -e "${GREEN}磁盘使用:${NC} ${DISK_COLOR}$DISK ($DISK_PERCENT%)${NC}"
-
-echo ""
-EOF
-
-    # 30-users - 当前登录用户
-    cat > /etc/update-motd.d/30-users << 'EOF'
-#!/bin/bash
-
-# 颜色定义
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-echo "════════════════════════════════════════════════════════════════"
-echo "  登录信息"
-echo "════════════════════════════════════════════════════════════════"
-
-# 当前登录用户数
-USER_COUNT=$(who | wc -l)
-echo -e "${GREEN}当前登录用户数:${NC} $USER_COUNT"
-
-# 显示登录用户
-if [ $USER_COUNT -gt 0 ]; then
-    echo ""
-    who | awk '{printf "  %-12s %-12s %s %s\n", $1, $2, $3, $4}'
-fi
-
-echo ""
-EOF
-
-    # 40-updates - 系统更新提示
-    cat > /etc/update-motd.d/40-updates << 'EOF'
-#!/bin/bash
-
-# 颜色定义
-YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-echo "════════════════════════════════════════════════════════════════"
-
-# 检查可更新的软件包数量（如果缓存存在）
-if [ -f /var/lib/apt/periodic/update-success-stamp ]; then
-    UPDATES=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
-    if [ "$UPDATES" -gt 0 ]; then
-        echo -e "${YELLOW}⚠ 有 $UPDATES 个软件包可以更新${NC}"
-        echo -e "  运行 ${GREEN}sudo apt update && sudo apt upgrade${NC} 进行更新"
-    else
-        echo -e "${GREEN}✓ 系统软件包已是最新${NC}"
-    fi
-else
-    echo -e "运行 ${GREEN}sudo apt update${NC} 检查更新"
-fi
-
-echo "════════════════════════════════════════════════════════════════"
-echo ""
-EOF
-
-    # 50-footer - 底部提示
-    cat > /etc/update-motd.d/50-footer << 'EOF'
-#!/bin/bash
-
-# 颜色定义
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-echo -e "${CYAN}提示: 输入 'll' 查看详细文件列表${NC}"
-echo -e "${CYAN}      输入 'htop' 查看系统进程${NC}"
-echo ""
-EOF
-
-    # 设置执行权限
-    chmod +x /etc/update-motd.d/10-header
-    chmod +x /etc/update-motd.d/20-sysinfo
-    chmod +x /etc/update-motd.d/30-users
-    chmod +x /etc/update-motd.d/40-updates
-    chmod +x /etc/update-motd.d/50-footer
-
-    log_info "欢迎信息脚本创建完成！"
-
-    # 测试显示
-    echo ""
-    log_info "预览效果："
-    echo "------------------------------------------------------------"
-    run-parts /etc/update-motd.d/
-    echo "------------------------------------------------------------"
-    echo ""
-
-    log_info "SSH 登录欢迎信息配置完成！"
-    log_info "下次 SSH 登录时将显示以上信息"
-}
-
-#===============================================================================
-# 11. 用户环境配置优化
-#===============================================================================
-configure_user_environment() {
-    log_step "用户环境配置优化"
-
-    # 询问配置范围
-    echo "请选择配置范围："
-    echo "  1) 全局配置（所有用户）"
-    echo "  2) 指定用户配置"
-    read -p "请选择 [1-2]: " scope_choice
-
-    local target_users=()
-    local bashrc_files=()
-    local vimrc_files=()
-
-    case $scope_choice in
-        1)
-            log_info "将为所有用户配置..."
-            bashrc_files=("/etc/bash.bashrc")
-            vimrc_files=("/etc/vim/vimrc.local")
+# 更新系统
+update_system() {
+    print_info "更新系统软件包..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            apt-get update
+            apt-get upgrade -y
+            apt-get autoremove -y
+            apt-get autoclean
             ;;
-        2)
-            read -p "请输入用户名（多个用户用空格分隔）: " user_input
-            if [[ -z "$user_input" ]]; then
-                log_error "未输入用户名"
-                return 1
-            fi
-
-            for username in $user_input; do
-                if ! id "$username" &>/dev/null; then
-                    log_error "用户 $username 不存在，跳过"
-                    continue
-                fi
-                target_users+=("$username")
-                local user_home=$(eval echo ~$username)
-                bashrc_files+=("$user_home/.bashrc")
-                vimrc_files+=("$user_home/.vimrc")
-            done
-
-            if [[ ${#target_users[@]} -eq 0 ]]; then
-                log_error "没有有效的用户"
-                return 1
-            fi
-
-            log_info "将为以下用户配置: ${target_users[*]}"
-            ;;
-        *)
-            log_error "无效的选择"
-            return 1
+        "yum"|"dnf")
+            $UPDATE_CMD
+            $PKG_MANAGER clean all
             ;;
     esac
+    
+    print_success "系统更新完成"
+}
 
-    #---------------------------------------------------------------------------
-    # 1. 配置实用别名
-    #---------------------------------------------------------------------------
-
-    # 检查别名配置状态
-    local aliases_exist=false
-    local aliases_enabled=false
-    for bashrc in "${bashrc_files[@]}"; do
-        if grep -q "# Custom aliases - debian12-setup" "$bashrc" 2>/dev/null; then
-            aliases_exist=true
-            # 检查是否被注释（禁用）
-            if grep -q "^alias ll='ls -alh --color=auto'" "$bashrc" 2>/dev/null; then
-                aliases_enabled=true
+# 安装基础软件包
+install_basic_packages() {
+    print_info "安装基础软件包..."
+    
+    # 基础软件包列表
+    basic_packages=(
+        "curl"
+        "wget"
+        "vim"
+        "git"
+        "htop"
+        "tree"
+        "unzip"
+        "zip"
+        "screen"
+        "tmux"
+        "rsync"
+        "lsof"
+        "netstat-net-tools"
+        "tcpdump"
+        "strace"
+        "iotop"
+        "iftop"
+        "dstat"
+    )
+    
+    # 根据不同系统调整包名
+    case $PKG_MANAGER in
+        "apt-get")
+            basic_packages+=("net-tools" "build-essential" "software-properties-common")
+            ;;
+        "yum"|"dnf")
+            basic_packages+=("net-tools" "gcc" "gcc-c++" "make" "epel-release")
+            # 移除不存在的包
+            basic_packages=("${basic_packages[@]/netstat-net-tools}")
+            ;;
+    esac
+    
+    for package in "${basic_packages[@]}"; do
+        if [ -n "$package" ]; then
+            print_info "安装 $package..."
+            if $INSTALL_CMD "$package" > /dev/null 2>&1; then
+                print_success "已安装 $package"
+            else
+                print_warning "安装 $package 失败，跳过"
             fi
-            break
         fi
     done
+    
+    print_success "基础软件包安装完成"
+}
 
-    if [ "$aliases_exist" = true ]; then
-        if [ "$aliases_enabled" = true ]; then
-            log_info "实用别名当前状态: ${GREEN}已启用${NC}"
-        else
-            log_info "实用别名当前状态: ${YELLOW}已禁用${NC}"
-        fi
+# 配置SSH安全
+configure_ssh() {
+    print_info "配置SSH安全设置..."
+    
+    SSH_CONFIG="/etc/ssh/sshd_config"
+    
+    # 备份原始配置
+    cp "$SSH_CONFIG" "${SSH_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    # SSH安全配置
+    cat > "$SSH_CONFIG" << 'EOF'
+# SSH安全配置
+Port 22
+Protocol 2
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_dsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
 
-        echo ""
-        echo "请选择操作："
-        echo "  1) $([ "$aliases_enabled" = true ] && echo "禁用别名" || echo "启用别名")"
-        echo "  2) 查看当前别名"
-        echo "  0) 跳过"
-        read -p "请选择 [0-2]: " alias_action
+# 登录配置
+LoginGraceTime 60
+PermitRootLogin yes
+StrictModes yes
+MaxAuthTries 3
+MaxSessions 10
 
-        case $alias_action in
-            1)
-                if [ "$aliases_enabled" = true ]; then
-                    # 禁用别名（注释掉）
-                    log_info "禁用别名..."
-                    for bashrc in "${bashrc_files[@]}"; do
-                        if [[ -f "$bashrc" ]] && grep -q "# Custom aliases - debian12-setup" "$bashrc"; then
-                            sed -i '/# Custom aliases - debian12-setup/,/^$/s/^alias /#alias /' "$bashrc"
-                            log_info "已在 $bashrc 中禁用别名"
-                        fi
-                    done
-                    log_info "别名已禁用，重新登录后生效"
-                else
-                    # 启用别名（取消注释）
-                    log_info "启用别名..."
-                    for bashrc in "${bashrc_files[@]}"; do
-                        if [[ -f "$bashrc" ]] && grep -q "# Custom aliases - debian12-setup" "$bashrc"; then
-                            sed -i '/# Custom aliases - debian12-setup/,/^$/s/^#alias /alias /' "$bashrc"
-                            log_info "已在 $bashrc 中启用别名"
-                        fi
-                    done
-                    log_info "别名已启用，重新登录后生效"
-                fi
-                return
-                ;;
-            2)
-                log_info "当前配置的别名："
-                for bashrc in "${bashrc_files[@]}"; do
-                    if [[ -f "$bashrc" ]]; then
-                        echo ""
-                        echo "文件: $bashrc"
-                        echo "----------------------------------------"
-                        grep "^alias\|^#alias" "$bashrc" | grep -A 50 "debian12-setup" | head -20
-                    fi
-                done
-                return
-                ;;
-            0|*)
-                return
-                ;;
-        esac
-    fi
+# 认证配置
+RSAAuthentication yes
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
 
-    # 首次配置
-    if confirm "是否添加实用别名（ll, grep, df, free 等优化）？" "y"; then
-        log_info "配置实用别名..."
+# 其他安全设置
+UsePAM yes
+X11Forwarding no
+PrintMotd no
+PrintLastLog yes
+TCPKeepAlive yes
+ClientAliveInterval 60
+ClientAliveCountMax 3
 
-        for bashrc in "${bashrc_files[@]}"; do
-            # 双重检查是否已存在标记
-            if grep -q "# Custom aliases - debian12-setup" "$bashrc" 2>/dev/null; then
-                log_warn "$bashrc 中已存在自定义别名，跳过"
-                continue
-            fi
+# 日志
+SyslogFacility AUTH
+LogLevel INFO
 
-            # 添加别名集合
-            cat >> "$bashrc" << 'EOF'
-
-# Custom aliases - debian12-setup
-# LS aliases
-alias ll='ls -lh --color=auto'
-alias la='ls -A --color=auto'
-alias l='ls -CF --color=auto'
-alias ls='ls --color=auto'
-
-# Grep aliases with color
-alias grep='grep --color=auto'
-alias egrep='egrep --color=auto'
-alias fgrep='fgrep --color=auto'
-
-# Disk and memory with human-readable sizes
-alias df='df -h'
-alias free='free -h'
-alias du='du -h'
-
-# Safe operations
-alias rm='rm -i'
-alias cp='cp -i'
-alias mv='mv -i'
-
-# Directory navigation
-alias ..='cd ..'
-alias ...='cd ../..'
-alias ....='cd ../../..'
-
-# Other useful aliases
-alias mkdir='mkdir -pv'
-alias wget='wget -c'
-alias path='echo -e ${PATH//:/\\n}'
-alias now='date +"%Y-%m-%d %H:%M:%S"'
-alias ports='netstat -tulanp'
+# SFTP配置
+Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
-            log_info "已添加到: $bashrc"
-        done
+    
+    # 重启SSH服务
+    systemctl restart sshd
+    systemctl enable sshd
+    
+    print_success "SSH配置完成"
+}
 
-        log_info "实用别名配置完成！"
-        echo ""
-        log_info "已添加的别名："
-        echo "  ll, la, l        - ls 系列增强"
-        echo "  grep, egrep      - 彩色搜索"
-        echo "  df, free, du     - 人类可读的大小显示"
-        echo "  rm, cp, mv       - 安全操作（询问确认）"
-        echo "  .., ..., ....    - 快速目录跳转"
-        echo "  mkdir            - 自动创建父目录"
-        echo "  wget             - 断点续传"
-        echo "  ports            - 查看端口占用"
-    fi
+# 配置防火墙
+configure_firewall() {
+    print_info "配置防火墙..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            # 安装并配置ufw
+            $INSTALL_CMD ufw
+            
+            # 默认策略
+            ufw --force reset
+            ufw default deny incoming
+            ufw default allow outgoing
+            
+            # 允许SSH
+            ufw allow ssh
+            
+            # 允许HTTP和HTTPS
+            ufw allow 80/tcp
+            ufw allow 443/tcp
+            
+            # 启用防火墙
+            ufw --force enable
+            ;;
+        "yum"|"dnf")
+            # 配置firewalld
+            systemctl start firewalld
+            systemctl enable firewalld
+            
+            # 允许SSH
+            firewall-cmd --permanent --add-service=ssh
+            
+            # 允许HTTP和HTTPS
+            firewall-cmd --permanent --add-service=http
+            firewall-cmd --permanent --add-service=https
+            
+            # 重载配置
+            firewall-cmd --reload
+            ;;
+    esac
+    
+    print_success "防火墙配置完成"
+}
 
-    #---------------------------------------------------------------------------
-    # 2. 设置系统默认编辑器为 vim
-    #---------------------------------------------------------------------------
-    if confirm "是否将系统默认编辑器设置为 vim？" "y"; then
-        log_info "设置默认编辑器..."
-
-        # 确保 vim 已安装
-        if ! command -v vim &> /dev/null; then
-            log_warn "vim 未安装，正在安装..."
-            apt install -y vim
+# 系统安全加固
+security_hardening() {
+    print_info "进行系统安全加固..."
+    
+    # 1. 设置文件权限
+    chmod 644 /etc/passwd
+    chmod 644 /etc/group
+    chmod 400 /etc/shadow
+    chmod 400 /etc/gshadow
+    
+    # 2. 禁用不必要的服务
+    services_to_disable=(
+        "bluetooth"
+        "avahi-daemon"
+        "cups"
+    )
+    
+    for service in "${services_to_disable[@]}"; do
+        if systemctl is-enabled "$service" > /dev/null 2>&1; then
+            systemctl disable "$service"
+            systemctl stop "$service"
+            print_info "已禁用服务: $service"
         fi
+    done
+    
+    # 3. 配置登录安全
+    cat >> /etc/security/limits.conf << 'EOF'
 
-        # 使用 update-alternatives 设置默认编辑器
-        if update-alternatives --set editor /usr/bin/vim.basic 2>/dev/null; then
-            log_info "已通过 update-alternatives 设置 vim 为默认编辑器"
-        else
-            # 如果失败，尝试其他路径
-            if update-alternatives --set editor /usr/bin/vim 2>/dev/null; then
-                log_info "已通过 update-alternatives 设置 vim 为默认编辑器"
+# 登录安全限制
+* soft core 0
+* hard core 0
+* soft nproc 65535
+* hard nproc 65535
+* soft nofile 65535
+* hard nofile 65535
+EOF
+    
+    # 4. 配置内核参数
+    cat >> /etc/sysctl.conf << 'EOF'
+
+# 网络安全参数
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.ip_forward = 0
+
+# 内存保护
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+
+# 文件系统保护
+fs.suid_dumpable = 0
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+EOF
+    
+    # 应用内核参数
+    sysctl -p
+    
+    print_success "系统安全加固完成"
+}
+
+# 优化系统性能
+optimize_performance() {
+    print_info "优化系统性能..."
+    
+    # 1. 调整内核参数
+    cat >> /etc/sysctl.conf << 'EOF'
+
+# 性能优化参数
+vm.swappiness = 10
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+vm.overcommit_memory = 1
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 5000
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 1200
+net.ipv4.tcp_max_tw_buckets = 5000
+EOF
+    
+    # 2. 优化I/O调度器
+    echo 'ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/scheduler}="deadline"' > /etc/udev/rules.d/60-schedulers.rules
+    
+    # 3. 配置透明大页
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled
+    echo never > /sys/kernel/mm/transparent_hugepage/defrag
+    
+    # 4. 添加到开机启动
+    cat >> /etc/rc.local << 'EOF'
+
+# 性能优化设置
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+EOF
+    
+    chmod +x /etc/rc.local
+    
+    print_success "系统性能优化完成"
+}
+
+# 安装Docker
+install_docker() {
+    print_info "安装Docker..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            # 安装依赖
+            $INSTALL_CMD apt-transport-https ca-certificates curl gnupg lsb-release
+            
+            # 添加Docker官方GPG密钥
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            
+            # 添加Docker仓库
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+            # 更新并安装Docker
+            apt-get update
+            $INSTALL_CMD docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            ;;
+        "yum"|"dnf")
+            # 安装依赖
+            $INSTALL_CMD yum-utils device-mapper-persistent-data lvm2
+            
+            # 添加Docker仓库
+            yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            
+            # 安装Docker
+            $INSTALL_CMD docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            ;;
+    esac
+    
+    # 启动并启用Docker
+    systemctl start docker
+    systemctl enable docker
+    
+    # 添加当前用户到docker组（如果不是root）
+    if [ "$SUDO_USER" ]; then
+        usermod -aG docker "$SUDO_USER"
+        print_info "用户 $SUDO_USER 已添加到docker组，请重新登录以生效"
+    fi
+    
+    print_success "Docker安装完成"
+}
+
+# 安装Docker Compose
+install_docker_compose() {
+    print_info "安装Docker Compose..."
+    
+    # 获取最新版本
+    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d\" -f4)
+    
+    # 下载并安装
+    curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    
+    chmod +x /usr/local/bin/docker-compose
+    
+    # 创建软链接
+    ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+    
+    print_success "Docker Compose安装完成，版本: $COMPOSE_VERSION"
+}
+
+# 安装Nginx
+install_nginx() {
+    print_info "安装Nginx..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            $INSTALL_CMD nginx
+            ;;
+        "yum"|"dnf")
+            $INSTALL_CMD nginx
+            ;;
+    esac
+    
+    # 启动并启用Nginx
+    systemctl start nginx
+    systemctl enable nginx
+    
+    # 创建基本配置
+    cat > /etc/nginx/conf.d/default.conf << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    root /var/www/html;
+    index index.html index.htm index.nginx-debian.html;
+    
+    location / {
+        try_files $uri $uri/ =404;
+    }
+    
+    # 安全头
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src * data: 'unsafe-eval' 'unsafe-inline'" always;
+    
+    # 隐藏Nginx版本
+    server_tokens off;
+}
+EOF
+    
+    # 测试配置并重载
+    nginx -t && systemctl reload nginx
+    
+    print_success "Nginx安装完成"
+}
+
+# 安装MySQL/MariaDB
+install_mysql() {
+    print_info "安装MySQL/MariaDB..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            $INSTALL_CMD mariadb-server mariadb-client
+            ;;
+        "yum"|"dnf")
+            $INSTALL_CMD mariadb-server mariadb
+            ;;
+    esac
+    
+    # 启动并启用服务
+    systemctl start mariadb
+    systemctl enable mariadb
+    
+    print_info "请运行 mysql_secure_installation 来安全配置数据库"
+    print_success "MySQL/MariaDB安装完成"
+}
+
+# 安装PHP
+install_php() {
+    print_info "安装PHP..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            $INSTALL_CMD php-fpm php-mysql php-curl php-gd php-intl php-mbstring php-soap php-xml php-xmlrpc php-zip
+            ;;
+        "yum"|"dnf")
+            $INSTALL_CMD php php-fpm php-mysqlnd php-curl php-gd php-intl php-mbstring php-soap php-xml php-xmlrpc php-zip
+            ;;
+    esac
+    
+    # 启动并启用PHP-FPM
+    systemctl start php-fpm
+    systemctl enable php-fpm
+    
+    print_success "PHP安装完成"
+}
+
+# 安装Node.js
+install_nodejs() {
+    print_info "安装Node.js..."
+    
+    # 安装NodeSource仓库
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            $INSTALL_CMD nodejs
+            ;;
+        "yum"|"dnf")
+            curl -fsSL https://rpm.nodesource.com/setup_lts.x | bash -
+            $INSTALL_CMD nodejs npm
+            ;;
+    esac
+    
+    # 安装常用全局包
+    npm install -g pm2 yarn
+    
+    print_success "Node.js安装完成"
+}
+
+# 安装Python开发环境
+install_python() {
+    print_info "安装Python开发环境..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            $INSTALL_CMD python3 python3-pip python3-dev python3-venv
+            ;;
+        "yum"|"dnf")
+            $INSTALL_CMD python3 python3-pip python3-devel
+            ;;
+    esac
+    
+    # 升级pip
+    python3 -m pip install --upgrade pip
+    
+    # 安装常用包
+    pip3 install virtualenv virtualenvwrapper
+    
+    print_success "Python开发环境安装完成"
+}
+
+# 安装监控工具
+install_monitoring_tools() {
+    print_info "安装监控工具..."
+    
+    # 安装Netdata
+    bash <(curl -Ss https://my-netdata.io/kickstart.sh) --dont-wait
+    
+    # 安装Prometheus Node Exporter
+    useradd --no-create-home --shell /bin/false node_exporter
+    
+    wget https://github.com/prometheus/node_exporter/releases/latest/download/node_exporter-1.3.1.linux-amd64.tar.gz
+    tar xvf node_exporter-1.3.1.linux-amd64.tar.gz
+    cp node_exporter-1.3.1.linux-amd64/node_exporter /usr/local/bin/
+    chown node_exporter:node_exporter /usr/local/bin/node_exporter
+    
+    # 创建systemd服务
+    cat > /etc/systemd/system/node_exporter.service << 'EOF'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl start node_exporter
+    systemctl enable node_exporter
+    
+    rm -rf node_exporter-1.3.1.linux-amd64*
+    
+    print_success "监控工具安装完成"
+}
+
+# 安装fail2ban
+install_fail2ban() {
+    print_info "安装fail2ban..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            $INSTALL_CMD fail2ban
+            ;;
+        "yum"|"dnf")
+            $INSTALL_CMD fail2ban
+            ;;
+    esac
+    
+    # 询问用户是否要添加白名单IP
+    echo
+    read -p "是否要添加白名单IP到fail2ban的ignoreip配置? (y/n): " -n 1 -r
+    echo
+    
+    WHITELIST_IPS=""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "请输入要添加到白名单的IP地址或CIDR范围 (每行一个，输入空行结束):"
+        echo "示例: 192.168.1.100, 10.0.0.0/8, 172.16.0.0/12"
+        
+        while true; do
+            read -p "IP/CIDR: " ip_input
+            
+            # 如果输入为空，结束输入
+            if [ -z "$ip_input" ]; then
+                break
+            fi
+            
+            # 验证IP格式
+            if validate_ip_format "$ip_input"; then
+                if [ -z "$WHITELIST_IPS" ]; then
+                    WHITELIST_IPS="$ip_input"
+                else
+                    WHITELIST_IPS="$WHITELIST_IPS $ip_input"
+                fi
+                print_success "已添加: $ip_input"
             else
-                log_warn "update-alternatives 设置失败，将使用环境变量方式"
-            fi
-        fi
-
-        # 同时设置环境变量（作为备用）
-        for bashrc in "${bashrc_files[@]}"; do
-            if ! grep -q "EDITOR=vim" "$bashrc" 2>/dev/null; then
-                echo "" >> "$bashrc"
-                echo "# Set default editor" >> "$bashrc"
-                echo "export EDITOR=vim" >> "$bashrc"
-                echo "export VISUAL=vim" >> "$bashrc"
-                log_info "已在 $bashrc 中设置编辑器环境变量"
-            fi
-        done
-
-        log_info "默认编辑器配置完成！"
-    fi
-
-    #---------------------------------------------------------------------------
-    # 3. 配置 vim
-    #---------------------------------------------------------------------------
-    if confirm "是否配置 vim（语法高亮、智能缩进、粘贴模式等）？" "y"; then
-        log_info "配置 vim..."
-
-        local vim_config='
-" ===================================================================
-" Vim Configuration - Auto generated by debian12-setup.sh
-" ===================================================================
-
-" 基本设置
-syntax on                   " 语法高亮
-set nocompatible           " 不兼容 vi 模式
-set backspace=indent,eol,start  " 退格键行为
-
-" 编码设置
-set encoding=utf-8
-set fileencoding=utf-8
-set fileencodings=utf-8,gbk,gb2312,cp936
-
-" 缩进设置
-set autoindent             " 自动缩进
-set smartindent            " 智能缩进
-set tabstop=4              " Tab 宽度
-set shiftwidth=4           " 自动缩进宽度
-set expandtab              " Tab 转空格
-set softtabstop=4          " 退格删除缩进
-
-" 搜索设置
-set hlsearch               " 高亮搜索结果
-set incsearch              " 增量搜索
-set ignorecase             " 搜索忽略大小写
-set smartcase              " 智能大小写（有大写字母时精确匹配）
-
-" 显示设置
-set showmatch              " 显示匹配的括号
-set matchtime=1            " 匹配括号高亮时间
-set cursorline             " 高亮当前行
-set ruler                  " 显示光标位置
-set showcmd                " 显示命令
-set laststatus=2           " 总是显示状态栏
-set wildmenu               " 命令行补全
-
-" 粘贴模式切换（F2 键）
-set pastetoggle=<F2>
-
-" 鼠标支持（方便选中和复制）
-set mouse=a
-set selection=exclusive
-set selectmode=mouse,key
-
-" 系统剪贴板（支持和系统互相复制粘贴）
-if has("clipboard")
-    set clipboard=unnamed   " 使用系统剪贴板
-    if has("unnamedplus")
-        set clipboard=unnamed,unnamedplus
-    endif
-endif
-
-" 文件类型检测
-filetype on
-filetype plugin on
-filetype indent on
-
-" 性能优化
-set lazyredraw             " 延迟重绘
-set ttyfast                " 快速终端连接
-
-" 其他设置
-set history=1000           " 历史命令数量
-set undolevels=1000        " 撤销级别
-set updatetime=300         " 更新时间（毫秒）
-set timeoutlen=500         " 映射超时时间
-
-" 去除烦人的提示音
-set noerrorbells
-set novisualbell
-set t_vb=
-
-" 文件备份
-set nobackup              " 不创建备份文件
-set noswapfile            " 不创建交换文件
-set nowritebackup
-
-" 颜色主题
-set background=dark        " 深色背景
-if &t_Co >= 256
-    colorscheme desert     " 256 色终端使用 desert 主题
-endif
-'
-
-        # 写入 vim 配置文件
-        for vimrc in "${vimrc_files[@]}"; do
-            # 如果是全局配置，确保目录存在
-            if [[ "$vimrc" == "/etc/vim/vimrc.local" ]]; then
-                mkdir -p /etc/vim
-            fi
-
-            # 备份现有配置
-            if [[ -f "$vimrc" ]]; then
-                local backup="${vimrc}.backup.$(date +%Y%m%d_%H%M%S)"
-                cp "$vimrc" "$backup"
-                log_info "已备份原配置: $backup"
-            fi
-
-            # 写入新配置
-            echo "$vim_config" > "$vimrc"
-            log_info "已配置: $vimrc"
-
-            # 设置权限（如果是用户配置文件）
-            if [[ "$scope_choice" == "2" ]]; then
-                for username in "${target_users[@]}"; do
-                    local user_home=$(eval echo ~$username)
-                    if [[ "$vimrc" == "$user_home/.vimrc" ]]; then
-                        chown "$username:$username" "$vimrc"
-                        chmod 644 "$vimrc"
-                        break
-                    fi
-                done
-            fi
-        done
-
-        log_info "Vim 配置完成！"
-        echo ""
-        log_info "Vim 使用提示："
-        echo "  - 按 F2 切换粘贴模式（粘贴代码时使用）"
-        echo "  - 支持鼠标选中和复制"
-        echo "  - 自动语法高亮和智能缩进"
-        echo "  - 使用 :set paste 手动开启粘贴模式"
-        echo "  - 使用 :set nopaste 关闭粘贴模式"
-    fi
-
-    #---------------------------------------------------------------------------
-    # 设置 bashrc 文件权限
-    #---------------------------------------------------------------------------
-    if [[ "$scope_choice" == "2" ]]; then
-        for username in "${target_users[@]}"; do
-            local user_home=$(eval echo ~$username)
-            if [[ -f "$user_home/.bashrc" ]]; then
-                chown "$username:$username" "$user_home/.bashrc"
-                chmod 644 "$user_home/.bashrc"
+                print_warning "无效的IP格式: $ip_input，请重新输入"
             fi
         done
     fi
+    
+    # 询问参数配置
+    echo
+    read -p "是否要配置fail2ban参数? (y/n): " -n 1 -r
+    echo
+    
+    BANTIME="10m"
+    FINDTIME="10m"
+    MAXRETRY="5"
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        read -p "封禁时间 (默认10m): " input_bantime
+        read -p "查找时间窗口 (默认10m): " input_findtime
+        read -p "最大重试次数 (默认5): " input_maxretry
+        
+        [ -n "$input_bantime" ] && BANTIME="$input_bantime"
+        [ -n "$input_findtime" ] && FINDTIME="$input_findtime"
+        [ -n "$input_maxretry" ] && MAXRETRY="$input_maxretry"
+    fi
+    
+    # 构建ignoreip行
+    IGNOREIP_LINE="ignoreip = 127.0.0.1/8 ::1"
+    if [ -n "$WHITELIST_IPS" ]; then
+        IGNOREIP_LINE="$IGNOREIP_LINE $WHITELIST_IPS"
+    fi
+    
+    # 创建jail.local配置
+    cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+${IGNOREIP_LINE}
+bantime = ${BANTIME}
+findtime = ${FINDTIME}
+maxretry = ${MAXRETRY}
 
-    log_info "用户环境配置完成！"
-    echo ""
-    log_warn "提示：配置已生效，请重新登录或执行以下命令应用更改："
-    if [[ "$scope_choice" == "1" ]]; then
-        echo "  source /etc/bash.bashrc"
-    else
-        for username in "${target_users[@]}"; do
-            echo "  su - $username  # 或重新登录"
-        done
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 1h
+
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+logpath = /var/log/nginx/error.log
+maxretry = 3
+
+[nginx-limit-req]
+enabled = true
+filter = nginx-limit-req
+logpath = /var/log/nginx/error.log
+maxretry = 10
+EOF
+    
+    # 启动并启用fail2ban
+    systemctl start fail2ban
+    systemctl enable fail2ban
+    
+    print_success "fail2ban安装完成"
+    if [ -n "$WHITELIST_IPS" ]; then
+        print_info "已添加白名单IP: $WHITELIST_IPS"
     fi
 }
 
-#===============================================================================
+# 验证IP格式的函数
+validate_ip_format() {
+    local ip="$1"
+    
+    # 检查是否包含CIDR符号
+    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        # CIDR格式验证
+        local ip_part="${ip%/*}"
+        local cidr_part="${ip#*/}"
+        
+        # 验证IP部分
+        if validate_single_ip "$ip_part"; then
+            # 验证CIDR部分 (0-32)
+            if [ "$cidr_part" -ge 0 ] && [ "$cidr_part" -le 32 ]; then
+                return 0
+            fi
+        fi
+    elif [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        # 单个IP格式验证
+        validate_single_ip "$ip"
+        return $?
+    fi
+    
+    return 1
+}
+
+# 验证单个IP地址的函数
+validate_single_ip() {
+    local ip="$1"
+    local IFS='.'
+    local -a octets=($ip)
+    
+    # 检查是否有4个部分
+    if [ ${#octets[@]} -ne 4 ]; then
+        return 1
+    fi
+    
+    # 检查每个部分是否在0-255范围内
+    for octet in "${octets[@]}"; do
+        if ! [[ "$octet" =~ ^[0-9]+$ ]] || [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+# 配置自动备份
+setup_backup() {
+    print_info "设置自动备份..."
+    
+    # 创建备份脚本
+    cat > /usr/local/bin/system_backup.sh << 'EOF'
+#!/bin/bash
+
+# 系统备份脚本
+BACKUP_DIR="/backup/$(date +%Y%m%d)"
+LOG_FILE="/var/log/backup.log"
+
+# 创建备份目录
+mkdir -p "$BACKUP_DIR"
+
+# 记录日志
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
+}
+
+log "开始系统备份"
+
+# 备份系统配置
+tar -czf "$BACKUP_DIR/etc_config.tar.gz" /etc/ 2>/dev/null
+log "配置文件备份完成"
+
+# 备份用户数据
+tar -czf "$BACKUP_DIR/home_data.tar.gz" /home/ 2>/dev/null
+log "用户数据备份完成"
+
+# 备份数据库（如果存在）
+if command -v mysqldump > /dev/null; then
+    mysqldump --all-databases > "$BACKUP_DIR/mysql_all.sql"
+    log "MySQL数据库备份完成"
+fi
+
+# 清理7天前的备份
+find /backup -type d -mtime +7 -exec rm -rf {} \;
+log "清理旧备份完成"
+
+log "系统备份完成"
+EOF
+    
+    chmod +x /usr/local/bin/system_backup.sh
+    
+    # 添加到crontab（每天凌晨2点执行）
+    (crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/system_backup.sh") | crontab -
+    
+    print_success "自动备份设置完成，每天凌晨2点执行"
+}
+
+# 配置日志轮转
+setup_logrotate() {
+    print_info "配置日志轮转..."
+    
+    cat > /etc/logrotate.d/system_init << 'EOF'
+/var/log/system_init.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 root root
+}
+
+/var/log/backup.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 root root
+}
+EOF
+    
+    print_success "日志轮转配置完成"
+}
+
+# 创建系统监控脚本
+create_monitoring_script() {
+    print_info "创建系统监控脚本..."
+    
+    cat > /usr/local/bin/system_monitor.sh << 'EOF'
+#!/bin/bash
+
+# 系统监控脚本
+THRESHOLD_CPU=80
+THRESHOLD_MEM=80
+THRESHOLD_DISK=85
+LOG_FILE="/var/log/system_monitor.log"
+ALERT_EMAIL="admin@example.com"
+
+# 记录日志
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"
+}
+
+# 发送告警
+send_alert() {
+    local subject="$1"
+    local message="$2"
+    
+    # 如果系统支持邮件发送
+    if command -v mail > /dev/null; then
+        echo "$message" | mail -s "$subject" "$ALERT_EMAIL"
+    fi
+    
+    log "ALERT: $subject - $message"
+}
+
+# 检查CPU使用率
+check_cpu() {
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | awk -F'%' '{print $1}')
+    cpu_usage=${cpu_usage%.*}
+    
+    if [ "$cpu_usage" -gt "$THRESHOLD_CPU" ]; then
+        send_alert "CPU使用率过高" "CPU使用率: ${cpu_usage}%"
+    fi
+}
+
+# 检查内存使用率
+check_memory() {
+    local mem_usage=$(free | grep Mem | awk '{printf("%.0f", $3/$2 * 100.0)}')
+    
+    if [ "$mem_usage" -gt "$THRESHOLD_MEM" ]; then
+        send_alert "内存使用率过高" "内存使用率: ${mem_usage}%"
+    fi
+}
+
+# 检查磁盘使用率
+check_disk() {
+    df -h | awk 'NR>1 {print $5 " " $6}' | while read line; do
+        usage=$(echo "$line" | awk '{print $1}' | sed 's/%//')
+        partition=$(echo "$line" | awk '{print $2}')
+        
+        if [ "$usage" -gt "$THRESHOLD_DISK" ]; then
+            send_alert "磁盘使用率过高" "分区 $partition 使用率: ${usage}%"
+        fi
+    done
+}
+
+# 检查系统负载
+check_load() {
+    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | awk -F',' '{print $1}' | sed 's/^ *//')
+    local cpu_cores=$(nproc)
+    
+    if (( $(echo "$load_avg > $cpu_cores" | bc -l) )); then
+        send_alert "系统负载过高" "当前负载: $load_avg, CPU核数: $cpu_cores"
+    fi
+}
+
+# 执行监控检查
+log "开始系统监控检查"
+check_cpu
+check_memory
+check_disk
+check_load
+log "系统监控检查完成"
+EOF
+    
+    chmod +x /usr/local/bin/system_monitor.sh
+    
+    # 添加到crontab（每5分钟执行一次）
+    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/system_monitor.sh") | crontab -
+    
+    print_success "系统监控脚本创建完成"
+}
+
+# 配置用户环境
+configure_user_environment() {
+    print_info "配置用户环境..."
+    
+    # 配置bash别名和函数
+    cat >> /etc/bash.bashrc << 'EOF'
+
+# 系统管理别名
+alias ll='ls -lh --color=auto'
+alias la='ls -lah --color=auto'
+alias l='ls -CF'
+alias grep='grep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias egrep='egrep --color=auto'
+
+# 系统信息
+alias sysinfo='echo "=== 系统信息 ===" && uname -a && echo && echo "=== 内存使用 ===" && free -h && echo && echo "=== 磁盘使用 ===" && df -h && echo && echo "=== 系统负载 ===" && uptime'
+
+# 网络相关
+alias myip='curl -s ipinfo.io/ip'
+alias ports='netstat -tulanp'
+
+# 进程管理
+alias pscpu='ps auxf | sort -nr -k 3'
+alias psmem='ps auxf | sort -nr -k 4'
+
+# 快速编辑
+alias bashrc='vim ~/.bashrc'
+alias vimrc='vim ~/.vimrc'
+
+# 安全相关
+alias rootlogin='grep "root" /var/log/auth.log | grep "session opened"'
+alias failedlogin='grep "Failed password" /var/log/auth.log'
+EOF
+    
+    # 配置vim
+    cat > /etc/vim/vimrc.local << 'EOF'
+" 基础设置
+set number
+set relativenumber
+set cursorline
+set hlsearch
+set incsearch
+set ignorecase
+set smartcase
+set autoindent
+set smartindent
+set expandtab
+set tabstop=4
+set shiftwidth=4
+set softtabstop=4
+set wrap
+set linebreak
+set mouse=a
+set clipboard=unnamedplus
+
+" 颜色设置
+syntax enable
+set background=dark
+colorscheme desert
+
+" 状态栏
+set laststatus=2
+set statusline=%F%m%r%h%w\ [FORMAT=%{&ff}]\ [TYPE=%Y]\ [POS=%l,%v][%p%%]\ %{strftime(\"%d/%m/%y\ -\ %H:%M\")}
+
+" 文件编码
+set encoding=utf-8
+set fileencodings=ucs-bom,utf-8,cp936,gb18030,big5,euc-jp,euc-kr,latin1
+
+" 快捷键
+map <F2> :NERDTreeToggle<CR>
+map <F3> :set nu!<CR>
+map <F4> :set wrap!<CR>
+EOF
+    
+    print_success "用户环境配置完成"
+}
+
+# 创建系统信息脚本
+create_sysinfo_script() {
+    print_info "创建系统信息脚本..."
+    
+    cat > /usr/local/bin/sysinfo << 'EOF'
+#!/bin/bash
+
+# 系统信息显示脚本
+
+echo -e "\033[1;32m=== 系统基本信息 ===\033[0m"
+echo "主机名: $(hostname)"
+echo "操作系统: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+echo "内核版本: $(uname -r)"
+echo "系统架构: $(uname -m)"
+echo "运行时间: $(uptime -p)"
+echo
+
+echo -e "\033[1;32m=== CPU信息 ===\033[0m"
+echo "CPU型号: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | sed 's/^ *//')"
+echo "CPU核数: $(nproc)"
+echo "CPU使用率: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | awk -F'%' '{print $1}')%"
+echo
+
+echo -e "\033[1;32m=== 内存信息 ===\033[0m"
+free -h
+echo
+
+echo -e "\033[1;32m=== 磁盘使用 ===\033[0m"
+df -h | grep -E '^/dev/'
+echo
+
+echo -e "\033[1;32m=== 网络接口 ===\033[0m"
+ip addr show | grep -E '^[0-9]+:' | awk '{print $2}' | sed 's/://'
+echo
+
+echo -e "\033[1;32m=== 系统负载 ===\033[0m"
+uptime
+echo
+
+echo -e "\033[1;32m=== 最近登录 ===\033[0m"
+last -5
+echo
+
+echo -e "\033[1;32m=== 进程TOP5 ===\033[0m"
+ps aux --sort=-%cpu | head -6
+EOF
+    
+    chmod +x /usr/local/bin/sysinfo
+    
+    print_success "系统信息脚本创建完成，使用 'sysinfo' 命令查看"
+}
+
+# 清理系统
+cleanup_system() {
+    print_info "清理系统..."
+    
+    case $PKG_MANAGER in
+        "apt-get")
+            apt-get autoremove -y
+            apt-get autoclean
+            ;;
+        "yum"|"dnf")
+            $PKG_MANAGER autoremove -y
+            $PKG_MANAGER clean all
+            ;;
+    esac
+    
+    # 清理临时文件
+    find /tmp -type f -atime +7 -delete 2>/dev/null || true
+    find /var/tmp -type f -atime +7 -delete 2>/dev/null || true
+    
+    # 清理日志文件
+    find /var/log -name "*.log" -type f -size +100M -exec truncate -s 0 {} \;
+    
+    print_success "系统清理完成"
+}
+
+# 生成系统报告
+generate_report() {
+    print_info "生成系统初始化报告..."
+    
+    REPORT_FILE="/root/system_init_report_$(date +%Y%m%d_%H%M%S).txt"
+    
+    cat > "$REPORT_FILE" << EOF
+=====================================
+    Linux系统初始化报告
+=====================================
+
+初始化时间: $(date)
+操作系统: $OS $VER
+包管理器: $PKG_MANAGER
+
+=== 已安装的软件 ===
+EOF
+    
+    # 检查已安装的软件
+    software_list=(
+        "curl"
+        "wget"
+        "vim"
+        "git"
+        "htop"
+        "docker"
+        "nginx"
+        "mysql"
+        "php"
+        "nodejs"
+        "python3"
+        "fail2ban"
+    )
+    
+    for software in "${software_list[@]}"; do
+        if command -v "$software" > /dev/null 2>&1; then
+            version=$(command -v "$software" && $software --version 2>/dev/null | head -1)
+            echo "✓ $software: $version" >> "$REPORT_FILE"
+        else
+            echo "✗ $software: 未安装" >> "$REPORT_FILE"
+        fi
+    done
+    
+    cat >> "$REPORT_FILE" << EOF
+
+=== 服务状态 ===
+EOF
+    
+    # 检查服务状态
+    services=(
+        "ssh"
+        "nginx"
+        "mysql"
+        "docker"
+        "fail2ban"
+    )
+    
+    for service in "${services[@]}"; do
+        if systemctl is-active "$service" > /dev/null 2>&1; then
+            echo "✓ $service: 运行中" >> "$REPORT_FILE"
+        else
+            echo "✗ $service: 未运行" >> "$REPORT_FILE"
+        fi
+    done
+    
+    cat >> "$REPORT_FILE" << EOF
+
+=== 安全配置 ===
+✓ SSH配置优化
+✓ 防火墙配置
+✓ 系统安全加固
+✓ fail2ban入侵防护
+
+=== 性能优化 ===
+✓ 内核参数优化
+✓ I/O调度器优化
+✓ 透明大页禁用
+
+=== 监控和备份 ===
+✓ 系统监控脚本
+✓ 自动备份配置
+✓ 日志轮转配置
+
+=== 重要文件位置 ===
+- 配置备份: $BACKUP_DIR
+- 初始化日志: $LOG_FILE
+- 系统监控日志: /var/log/system_monitor.log
+- 备份日志: /var/log/backup.log
+
+=== 常用命令 ===
+- sysinfo: 查看系统信息
+- /usr/local/bin/system_monitor.sh: 手动运行系统监控
+- /usr/local/bin/system_backup.sh: 手动运行系统备份
+
+=== 注意事项 ===
+1. 请及时更改默认密码
+2. 配置SSH密钥认证
+3. 根据需要调整防火墙规则
+4. 定期检查系统日志
+5. 保持系统更新
+
+报告生成完成: $(date)
+EOF
+    
+    print_success "系统报告已生成: $REPORT_FILE"
+}
+
 # 主菜单
-#===============================================================================
 show_menu() {
     clear
-    echo -e "${BLUE}╔════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║     Debian 12 系统初始化配置脚本              ║${NC}"
-    echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo "  1) 系统更新升级"
-    echo "  2) 安装 Docker (官方源)"
-    echo "  3) 新建用户"
-    echo "  4) 添加 SSH 密钥"
-    echo "  5) 安装常用工具"
-    echo "  6) 配置时区 (Asia/Shanghai)"
-    echo "  7) 配置 UFW 防火墙"
-    echo "  8) 配置 SSH 安全设置 ⚠️"
-    echo "  9) 安装配置 Fail2ban"
-    echo " 10) 配置 SSH 登录欢迎信息"
-    echo " 11) 用户环境配置优化 (别名/vim配置/默认编辑器)"
-    echo ""
-    echo "  a) 执行全部操作（推荐新系统）"
+    echo -e "${CYAN}"
+    echo "=========================================="
+    echo "         Linux系统初始化脚本 v2.0"
+    echo "=========================================="
+    echo -e "${NC}"
+    echo -e "${WHITE}选择要执行的操作:${NC}"
+    echo
+    echo -e "${GREEN}基础设置:${NC}"
+    echo "  1) 完整初始化 (推荐)"
+    echo "  2) 系统更新"
+    echo "  3) 安装基础软件包"
+    echo "  4) SSH安全配置"
+    echo "  5) 防火墙配置"
+    echo "  6) 系统安全加固"
+    echo "  7) 性能优化"
+    echo
+    echo -e "${GREEN}服务安装:${NC}"
+    echo " 10) 安装Docker"
+    echo " 11) 安装Docker Compose"
+    echo " 12) 安装Nginx"
+    echo " 13) 安装MySQL/MariaDB"
+    echo " 14) 安装PHP"
+    echo " 15) 安装Node.js"
+    echo " 16) 安装Python环境"
+    echo " 17) 安装监控工具"
+    echo " 18) 安装fail2ban"
+    echo
+    echo -e "${GREEN}系统管理:${NC}"
+    echo " 20) 配置自动备份"
+    echo " 21) 配置日志轮转"
+    echo " 22) 创建监控脚本"
+    echo " 23) 配置用户环境"
+    echo " 24) 创建系统信息脚本"
+    echo " 25) 系统清理"
+    echo
+    echo -e "${GREEN}其他:${NC}"
+    echo " 30) 生成系统报告"
+    echo " 31) 查看系统信息"
     echo "  0) 退出"
-    echo ""
+    echo
+    echo -e "${YELLOW}=========================================${NC}"
 }
 
-# 执行全部操作
-run_all() {
-    log_step "开始执行全部配置"
-
-    log_warn "将依次执行以下操作："
-    echo "  1. 系统更新"
-    echo "  2. 安装常用工具"
-    echo "  3. 配置时区"
-    echo "  4. 安装 Docker"
-    echo "  5. 新建用户"
-    echo "  6. 添加 SSH 密钥"
-    echo "  7. 用户环境配置优化（可选）"
-    echo "  8. SSH 登录欢迎信息（可选）"
-    echo "  9. 配置防火墙"
-    echo " 10. 安装 Fail2ban"
-    echo " 11. 配置 SSH 安全设置（最后执行）"
-    echo ""
-
-    if ! confirm "确认执行全部操作？"; then
-        return
-    fi
-
-    # 按安全顺序执行
+# 完整初始化
+full_initialization() {
+    print_info "开始完整系统初始化..."
+    
+    backup_configs
     update_system
-    install_common_tools
-    configure_timezone
-    install_docker
-    create_user
-    add_ssh_key
-
-    # 用户环境配置（可选）
-    if confirm "是否配置用户环境（实用别名、vim配置等）？"; then
-        configure_user_environment
-    fi
-
-    # SSH 欢迎信息（可选）
-    if confirm "是否配置 SSH 登录欢迎信息（显示系统状态）？"; then
-        configure_ssh_motd
-    fi
-
-    configure_ufw
+    install_basic_packages
+    configure_ssh
+    configure_firewall
+    security_hardening
+    optimize_performance
     install_fail2ban
-
-    # SSH 配置放在最后，确保已经添加密钥
-    log_warn "最后一步：SSH 安全配置"
-    if confirm "是否配置 SSH 安全设置（建议在其他配置完成后执行）？" "y"; then
-        configure_ssh
-    fi
-
-    log_step "全部配置完成！"
-    log_info "建议重启系统以应用所有更改"
-    if confirm "是否现在重启系统？"; then
-        reboot
-    fi
+    setup_backup
+    setup_logrotate
+    create_monitoring_script
+    configure_user_environment
+    create_sysinfo_script
+    cleanup_system
+    generate_report
+    
+    print_success "完整系统初始化完成!"
 }
 
-#===============================================================================
 # 主程序
-#===============================================================================
 main() {
+    # 检查root权限
     check_root
-
+    
+    # 初始化日志
+    touch "$LOG_FILE"
+    log "系统初始化脚本启动"
+    
+    # 获取系统信息
+    get_os_info
+    detect_package_manager
+    
+    # 显示菜单和处理用户选择
     while true; do
         show_menu
-        read -p "请选择操作 [0-11/a]: " choice
-
+        read -p "请输入选项 [0-31]: " choice
+        
         case $choice in
-            1) update_system ;;
-            2) install_docker ;;
-            3) create_user ;;
-            4) add_ssh_key ;;
-            5) install_common_tools ;;
-            6) configure_timezone ;;
-            7) configure_ufw ;;
-            8) configure_ssh ;;
-            9) install_fail2ban ;;
-            10) configure_ssh_motd ;;
-            11) configure_user_environment ;;
-            a|A) run_all ;;
+            1)
+                full_initialization
+                ;;
+            2)
+                update_system
+                ;;
+            3)
+                install_basic_packages
+                ;;
+            4)
+                configure_ssh
+                ;;
+            5)
+                configure_firewall
+                ;;
+            6)
+                security_hardening
+                ;;
+            7)
+                optimize_performance
+                ;;
+            10)
+                install_docker
+                ;;
+            11)
+                install_docker_compose
+                ;;
+            12)
+                install_nginx
+                ;;
+            13)
+                install_mysql
+                ;;
+            14)
+                install_php
+                ;;
+            15)
+                install_nodejs
+                ;;
+            16)
+                install_python
+                ;;
+            17)
+                install_monitoring_tools
+                ;;
+            18)
+                install_fail2ban
+                ;;
+            20)
+                setup_backup
+                ;;
+            21)
+                setup_logrotate
+                ;;
+            22)
+                create_monitoring_script
+                ;;
+            23)
+                configure_user_environment
+                ;;
+            24)
+                create_sysinfo_script
+                ;;
+            25)
+                cleanup_system
+                ;;
+            30)
+                generate_report
+                ;;
+            31)
+                if command -v sysinfo > /dev/null; then
+                    sysinfo
+                else
+                    print_warning "系统信息脚本未安装，请先选择选项24"
+                fi
+                ;;
             0)
-                log_info "退出脚本"
+                print_info "退出系统初始化脚本"
+                log "系统初始化脚本结束"
                 exit 0
                 ;;
             *)
-                log_error "无效的选择，请重新输入"
-                sleep 2
+                print_error "无效选项，请重新选择"
                 ;;
         esac
-
-        if [[ "$choice" != "0" ]]; then
-            echo ""
-            read -p "按 Enter 键继续..."
-        fi
+        
+        echo
+        read -p "按Enter键继续..." -r
     done
 }
 
-# 运行主程序
-main
+# 捕获中断信号
+trap 'print_error "脚本被中断"; exit 1' INT TERM
+
+# 执行主程序
+main "$@"
