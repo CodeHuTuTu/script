@@ -902,9 +902,30 @@ EOF
         systemctl start fail2ban
     fi
 
+    # 等待 socket 就绪
+    log_info "等待 Fail2ban 服务就绪..."
+    local sock1="/run/fail2ban/fail2ban.sock"
+    local sock2="/var/run/fail2ban/fail2ban.sock"
+    local ok=false
+
+    for i in {1..10}; do
+        if [ -S "$sock1" ] || [ -S "$sock2" ]; then
+            ok=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$ok" = false ]; then
+        log_warn "Fail2ban socket 未就绪，可能服务启动较慢或启动失败"
+        log_info "当前 fail2ban 服务状态："
+        systemctl status fail2ban --no-pager || true
+    fi
+
     log_info "Fail2ban 状态："
     fail2ban-client status || true
 }
+
 
 #===============================================================================
 # 10. 配置 SSH 登录欢迎信息（MOTD）
