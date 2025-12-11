@@ -271,6 +271,7 @@ install_common_tools() {
         "lsof"          # 查看打开的文件
         "dnsutils"      # DNS 工具（dig, nslookup）
         "tcpdump"       # 网络抓包
+        "sudo"          # sudo
     )
 
     log_info "将安装以下工具："
@@ -295,7 +296,7 @@ install_common_tools_unattended() {
     log_step "无人值守：安装常用工具"
     local tools=(
         "vim" "git" "curl" "wget" "htop" "net-tools" "tree" "unzip"
-        "zip" "tmux" "ncdu" "iotop" "sysstat" "lsof" "dnsutils" "tcpdump"
+        "zip" "tmux" "ncdu" "iotop" "sysstat" "lsof" "dnsutils" "tcpdump" "sudo"
     )
     log_info "将安装以下工具（无人值守，自动确认）："
     for tool in "${tools[@]}"; do
