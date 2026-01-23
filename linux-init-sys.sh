@@ -1159,7 +1159,8 @@ cat >> "$bashrc" << 'EOF'
 # Custom aliases - debian12-setup
 # LS aliases
 alias ll='ls -lh --color=auto'
-alias la='ls -A --color=auto'
+alias la='ls -lh --color=auto'
+
 alias l='ls -CF --color=auto'
 alias ls='ls --color=auto'
 
@@ -1291,10 +1292,12 @@ set wildmenu               " 命令行补全
 " 粘贴模式切换（F2 键）
 set pastetoggle=<F2>
 
-" 鼠标支持（方便选中和复制）
-set mouse=a
-set selection=exclusive
-set selectmode=mouse,key
+" 鼠标设置
+" 禁用鼠标模式，允许终端接管鼠标（解决无法选中复制的问题）
+if has('mouse')
+  set mouse-=a
+endif
+
 
 " 系统剪贴板（支持和系统互相复制粘贴）
 if has("clipboard")
@@ -1371,7 +1374,8 @@ log_info "Vim 配置完成！"
 echo ""
 log_info "Vim 使用提示："
 echo "  - 按 F2 切换粘贴模式（粘贴代码时使用）"
-echo "  - 支持鼠标选中和复制"
+echo "  - 鼠标已禁用，直接使用终端选中即可复制"
+
 echo "  - 自动语法高亮和智能缩进"
 echo "  - 使用 :set paste 手动开启粘贴模式"
 echo "  - 使用 :set nopaste 关闭粘贴模式"
@@ -1437,7 +1441,39 @@ fi
 if confirm "是否应用额外网络优化（提高并发连接能力，参数较保守）？" "y"; then
     local conf_net="/etc/sysctl.d/99-net-tuning.conf"
     log_info "写入网络优化参数到 $conf_net"
-    cat > "$conf_net" << 'EOF'
+
+    # 动态检测带宽并计算 TCP 窗口大小
+    local default_speed=1000 # 默认 1000Mbps
+    local speed=$default_speed
+    local interface=""
+    
+    # 尝试检测主接口
+    interface=$(ip route show default | awk '/default/ {print $5}' | head -1)
+    if [[ -n "$interface" ]]; then
+        local sys_speed_path="/sys/class/net/$interface/speed"
+        if [[ -f "$sys_speed_path" ]]; then
+            local detect_speed=$(cat "$sys_speed_path" 2>/dev/null || echo "")
+            # 只有当检测到的速度大于 0 时才采用（排除 -1 或 0）
+            if [[ "$detect_speed" =~ ^[0-9]+$ ]] && [ "$detect_speed" -gt 0 ]; then
+                speed=$detect_speed
+                log_info "检测到网络接口 $interface 速率: ${speed}Mbps"
+            else
+                log_warn "接口 $interface 未报告有效速率，使用默认值: ${speed}Mbps"
+            fi
+        fi
+    fi
+
+    # 计算窗口大小 (以 100ms RTT 为基准)
+    # BDP = Bandwidth (bytes/sec) * RTT (sec)
+    # 1 Mbps = 125,000 bytes/sec
+    # Buffer = speed * 125000 * 0.1
+    local max_buffer=$((speed * 125000 / 10))
+    if [ "$max_buffer" -lt 4194304 ]; then max_buffer=4194304; fi # 最小 4MB
+    if [ "$max_buffer" -gt 134217728 ]; then max_buffer=134217728; fi # 最大 128MB
+    
+    log_info "根据速率 (${speed}Mbps) 计算 TCP 窗口最大值: $((max_buffer/1024/1024))MB"
+
+    cat > "$conf_net" << EOF
 # 提高监听队列
 net.core.somaxconn=4096
 net.core.netdev_max_backlog=16384
@@ -1450,7 +1486,15 @@ net.ipv4.tcp_fin_timeout=30
 
 # 增大本地端口范围（适合大量出站连接）
 net.ipv4.ip_local_port_range=10240 65535
+
+# TCP 窗口优化 (动态计算: 速率 ${speed}Mbps, RTT ~100ms)
+net.ipv4.tcp_rmem=4096 87380 $max_buffer
+net.ipv4.tcp_wmem=4096 65536 $max_buffer
+
+# 禁用空闲后的慢启动
+net.ipv4.tcp_slow_start_after_idle=0
 EOF
+
     sysctl --system
     log_info "网络优化参数已应用"
 fi
@@ -1459,7 +1503,85 @@ log_info "网络优化完成（已针对代理/高并发场景进行调整）"
 }
 
 #===============================================================================
+# 13. 检查并配置 Swap
+#===============================================================================
+configure_swap() {
+    log_step "检查并配置虚拟内存 (Swap)"
+
+    # 获取 RAM 大小 (MB)
+    local ram_size=$(free -m | awk '/Mem:/ {print $2}')
+    # 获取 Swap 大小 (MB)
+    local swap_size=$(free -m | awk '/Swap:/ {print $2}')
+
+    log_info "物理内存: ${ram_size}MB"
+    log_info "当前 Swap: ${swap_size}MB"
+
+    # 阈值：如果内存小于 2048MB (2GB) 且 Swap 不足 1024MB
+    # 或者用户强制要求
+    if [ "$ram_size" -lt 2048 ] && [ "$swap_size" -lt 1024 ]; then
+        log_warn "检测到内存少于 2GB 且 Swap 不足，建议添加 Swap."
+        
+        local target_swap_size=2048
+        local swap_file="/swapfile"
+
+        if [ -f "$swap_file" ]; then
+             log_warn "Swap 文件 $swap_file 已存在，跳过创建"
+             return
+        fi
+
+        if confirm "是否自动创建 ${target_swap_size}MB Swap 文件？" "y"; then
+             log_info "正在创建 Swap 文件 ($target_swap_size MB)..."
+             # 使用 fallocate 快速创建，失败则回退到 dd
+             if ! fallocate -l ${target_swap_size}M $swap_file 2>/dev/null; then
+                 dd if=/dev/zero of=$swap_file bs=1M count=$target_swap_size
+             fi
+             
+             chmod 600 $swap_file
+             mkswap $swap_file
+             swapon $swap_file
+             
+             # 持久化
+             if ! grep -q "$swap_file" /etc/fstab; then
+                 echo "$swap_file none swap sw 0 0" >> /etc/fstab
+             fi
+             
+             log_info "Swap 创建成功！"
+             
+             # 优化 Swap 使用倾向 (对于服务器，建议较低 swappiness 以优先使用物理内存)
+             sysctl vm.swappiness=10
+             if ! grep -q "vm.swappiness" /etc/sysctl.conf; then
+                echo "vm.swappiness=10" >> /etc/sysctl.conf
+             fi
+             
+             # 优化 VFS 缓存压力
+             sysctl vm.vfs_cache_pressure=50
+             if ! grep -q "vm.vfs_cache_pressure" /etc/sysctl.conf; then
+                echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.conf
+             fi
+        fi
+    else
+        log_info "内存充足或已存在 Swap，无需调整。"
+        if confirm "是否强制增加 Swap (例如再加 2GB)？" "n"; then
+             local swap_file_extra="/swapfile_extra"
+             if [ -f "$swap_file_extra" ]; then
+                 log_warn "$swap_file_extra 已存在"
+                 return
+             fi
+             local extra_size=2048
+             log_info "创建额外 Swap 文件..."
+             fallocate -l ${extra_size}M $swap_file_extra || dd if=/dev/zero of=$swap_file_extra bs=1M count=$extra_size
+             chmod 600 $swap_file_extra
+             mkswap $swap_file_extra
+             swapon $swap_file_extra
+             echo "$swap_file_extra none swap sw 0 0" >> /etc/fstab
+             log_info "额外 Swap 创建完成"
+        fi
+    fi
+}
+
+#===============================================================================
 # 主菜单
+
 #===============================================================================
 show_menu() {
 clear
@@ -1479,7 +1601,9 @@ echo "  9) 安装配置 Fail2ban"
 echo " 10) 配置 SSH 登录欢迎信息"
 echo " 11) 用户环境配置优化 (别名/vim配置/默认编辑器)"
 echo " 12) 网络优化 (BBR 等，适合代理场景)"
+echo " 13) 检查并配置 Swap (自动增加虚拟内存)"
 echo ""
+
 echo "  a) 执行全部操作（推荐新系统）"
 echo "  0) 退出"
 echo ""
@@ -1501,8 +1625,10 @@ echo "  7. 用户环境配置优化（可选）"
 echo "  8. SSH 登录欢迎信息（可选）"
 echo "  9. 配置防火墙"
 echo " 10. 安装 Fail2ban"
-echo " 11. 网络优化（可选，BBR 等）"
-echo " 12. 配置 SSH 安全设置（最后执行）"
+echo " 11. 配置 Swap（如内存不足自动增加）"
+echo " 12. 网络优化（可选，BBR 等）"
+echo " 13. 配置 SSH 安全设置（最后执行）"
+
 echo ""
 
 if ! confirm "确认执行全部操作？"; then
@@ -1516,6 +1642,10 @@ configure_timezone
 install_docker
 create_user
 add_ssh_key
+
+# 检查 Swap
+configure_swap
+
 
 # 用户环境配置（可选）
 if confirm "是否配置用户环境（实用别名、vim配置等）？"; then
@@ -1571,6 +1701,8 @@ case $choice in
 10) configure_ssh_motd ;;
 11) configure_user_environment ;;
 12) optimize_network ;;
+13) configure_swap ;;
+
 a|A) run_all ;;
 0)
 log_info "退出脚本"
