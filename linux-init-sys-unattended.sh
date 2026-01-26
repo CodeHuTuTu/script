@@ -1987,8 +1987,22 @@ configure_swap() {
 
         if confirm "是否自动创建 ${target_swap_size}MB Swap 文件？" "y"; then
              log_info "正在创建 Swap 文件 ($target_swap_size MB)..."
-             if ! fallocate -l ${target_swap_size}M $swap_file 2>/dev/null; then
-                 dd if=/dev/zero of=$swap_file bs=1M count=$target_swap_size
+             
+             # 获取文件所在目录的文件系统类型
+             local swap_dir=$(dirname "$swap_file")
+             local fs_type=$(df -T "$swap_dir" | awk 'NR==2 {print $2}')
+             
+             if [[ "$fs_type" == "btrfs" ]]; then
+                 log_info "检测到 Btrfs，特殊处理..."
+                 truncate -s 0 "$swap_file"
+                 chattr +C "$swap_file"
+                 if ! fallocate -l ${target_swap_size}M "$swap_file" 2>/dev/null; then
+                     dd if=/dev/zero of="$swap_file" bs=1M count=$target_swap_size status=progress
+                 fi
+             else
+                 if ! fallocate -l ${target_swap_size}M "$swap_file" 2>/dev/null; then
+                     dd if=/dev/zero of="$swap_file" bs=1M count=$target_swap_size status=progress
+                 fi
              fi
              
              chmod 600 $swap_file
@@ -2020,7 +2034,23 @@ configure_swap() {
              fi
              local extra_size=2048
              log_info "创建额外 Swap 文件..."
-             fallocate -l ${extra_size}M $swap_file_extra || dd if=/dev/zero of=$swap_file_extra bs=1M count=$extra_size
+             
+             # 获取文件所在目录的文件系统类型
+             local swap_dir=$(dirname "$swap_file_extra")
+             local fs_type=$(df -T "$swap_dir" | awk 'NR==2 {print $2}')
+             
+             if [[ "$fs_type" == "btrfs" ]]; then
+                 log_info "检测到 Btrfs，特殊处理..."
+                 truncate -s 0 "$swap_file_extra"
+                 chattr +C "$swap_file_extra"
+                 if ! fallocate -l ${extra_size}M "$swap_file_extra" 2>/dev/null; then
+                     dd if=/dev/zero of="$swap_file_extra" bs=1M count=$extra_size status=progress
+                 fi
+             else
+                 if ! fallocate -l ${extra_size}M "$swap_file_extra" 2>/dev/null; then
+                     dd if=/dev/zero of="$swap_file_extra" bs=1M count=$extra_size status=progress
+                 fi
+             fi
              chmod 600 $swap_file_extra
              mkswap $swap_file_extra
              swapon $swap_file_extra
@@ -2048,7 +2078,17 @@ configure_swap_unattended() {
              return 0
         fi
         
-        if fallocate -l ${target_swap_size}M $swap_file 2>/dev/null || dd if=/dev/zero of=$swap_file bs=1M count=$target_swap_size; then
+        # Btrfs 处理逻辑
+        local swap_dir=$(dirname "$swap_file")
+        local fs_type=$(df -T "$swap_dir" | awk 'NR==2 {print $2}')
+        log_info "文件系统: $fs_type"
+
+        if [[ "$fs_type" == "btrfs" ]]; then
+             truncate -s 0 "$swap_file"
+             chattr +C "$swap_file"
+        fi
+
+        if fallocate -l ${target_swap_size}M "$swap_file" 2>/dev/null || dd if=/dev/zero of="$swap_file" bs=1M count=$target_swap_size; then
              chmod 600 $swap_file
              mkswap $swap_file >/dev/null
              swapon $swap_file
@@ -2129,7 +2169,6 @@ run_all() {
     install_common_tools
     configure_timezone
     install_docker
-    create_user
     create_user
     add_ssh_key
     

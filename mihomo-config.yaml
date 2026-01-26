@@ -1,0 +1,260 @@
+# ==============================================================================
+# Mihomo (Clash Meta) Configuration - Best Practices 2026
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 基础设置
+# ------------------------------------------------------------------------------
+port: 7890
+socks-port: 7891
+mixed-port: 7892
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+ipv6: true
+external-controller: 0.0.0.0:9090
+
+# ------------------------------------------------------------------------------
+# 2. DNS 设置 (防泄露核心)
+# ------------------------------------------------------------------------------
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*'
+    - '+.lan'
+    - '+.local'
+  
+  # 默认 DNS (用于非 IP 分流的兜底解析，通常使用加密 DNS)
+  nameserver:
+    - 'https://dns.google/dns-query'
+    - 'https://cloudflare-dns.com/dns-query'
+
+  # 直连 DNS (用于国内域名解析，加快速度并利用 CDN)
+  # 使用 nameserver-policy 进行精准分流
+  nameserver-policy:
+    "geosite:cn,private":
+      - 'https://dns.alidns.com/dns-query'
+      - 'https://doh.pub/dns-query'
+
+# ------------------------------------------------------------------------------
+# 3. 嗅探设置 (辅助分流)
+# ------------------------------------------------------------------------------
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+
+# ------------------------------------------------------------------------------
+# 4. 代理提供商 (机场订阅)
+# ------------------------------------------------------------------------------
+proxy-providers:
+  MyAirport:
+    type: http
+    # 替换下面的 URL 为您的订阅地址
+    url: "https://example.com/api/v1/client/subscribe?token=YOUR_TOKEN"
+    interval: 3600
+    path: ./proxies/airport.yaml
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+
+# ------------------------------------------------------------------------------
+# 5. 手动节点 (VLESS/VMess/Hysteria2 等)
+# ------------------------------------------------------------------------------
+proxies:
+  # 示例 VLESS 节点
+  - name: "Myself-VLESS"
+    type: vless
+    server: 1.2.3.4
+    port: 443
+    uuid: your-uuid-here
+    network: ws
+    tls: true
+    udp: true
+    servername: example.com
+    ws-opts:
+      path: /ws
+      headers:
+        Host: example.com
+
+  # 示例 Hysteria2 节点
+  - name: "Myself-Hy2"
+    type: hysteria2
+    server: 1.2.3.4
+    port: 443
+    password: your-password
+    sni: example.com
+    skip-cert-verify: false
+
+# ------------------------------------------------------------------------------
+# 6. 策略组 (地域分流与筛选)
+# ------------------------------------------------------------------------------
+proxy-groups:
+  # === 主选择组 ===
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+      - ♻️ 自动选择
+      - 🇭🇰 香港节点
+      - 🇯🇵 日本节点
+      - 🇺🇸 美国节点
+      - 🇸🇬 新加坡节点
+      - 🇹🇼 台湾节点
+      - 🌍 其他节点
+      - Myself-VLESS
+      - Myself-Hy2
+
+  # === 自动测速 ===
+  - name: ♻️ 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - MyAirport
+    proxies:
+      - Myself-VLESS
+      - Myself-Hy2
+
+  # === 地域分组 (正则过滤) ===
+  - name: 🇭🇰 香港节点
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - MyAirport
+    # 过滤关键词: 港, HK, Hong Kong (忽略大小写)
+    filter: "(?i)港|HK|Hong Kong"
+
+  - name: 🇯🇵 日本节点
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - MyAirport
+    # 过滤关键词: 日本, JP, Japan
+    filter: "(?i)日本|JP|Japan"
+
+  - name: 🇺🇸 美国节点
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - MyAirport
+    # 过滤关键词: 美, US, United States
+    filter: "(?i)美|US|United States"
+
+  - name: 🇸🇬 新加坡节点
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - MyAirport
+    # 过滤关键词: 新, SG, Singapore
+    filter: "(?i)新|SG|Singapore"
+
+  - name: 🇹🇼 台湾节点
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    use:
+      - MyAirport
+    # 过滤关键词: 台, TW, Taiwan
+    filter: "(?i)台|TW|Taiwan"
+
+  # === 其他节点 (反向匹配) ===
+  # 说明: 匹配所有不包含上述地域关键词的节点
+  - name: 🌍 其他节点
+    type: select
+    use:
+      - MyAirport
+    # 正则逻辑: 排除所有主流地区，剩下的归为 Other
+    filter: "(?i)^(?!.*(?:港|HK|Hong Kong|日本|JP|Japan|美|US|United States|新|SG|Singapore|台|TW|Taiwan)).*"
+
+  # === 功能分组 ===
+  - name: 🐟 漏网之鱼
+    type: select
+    proxies:
+      - 🚀 节点选择
+      - DIRECT
+
+  - name: 🛑 广告拦截
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+
+# ------------------------------------------------------------------------------
+# 7. 规则集提供商 (Rule Providers) - 使用 MetaCubeX 仓库
+# ------------------------------------------------------------------------------
+rule-providers:
+  # 广告规则
+  ads:
+    type: http
+    behavior: domain
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geosite/category-ads-all.mrs"
+    path: ./ruleset/ads.mrs
+    interval: 86400
+
+  # 国内域名
+  cn_domain:
+    type: http
+    behavior: domain
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geosite/cn.mrs"
+    path: ./ruleset/cn_domain.mrs
+    interval: 86400
+
+  # 国外常见应用 (Google, Telegram, Twitter 等)
+  geolocation-!cn:
+    type: http
+    behavior: domain
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geosite/geolocation-!cn.mrs"
+    path: ./ruleset/geolocation-!cn.mrs
+    interval: 86400
+  
+  # 国内 IP
+  cn_ip:
+    type: http
+    behavior: ipcidr
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip/cn.mrs"
+    path: ./ruleset/cn_ip.mrs
+    interval: 86400
+
+# ------------------------------------------------------------------------------
+# 8. 规则策略 (Rules)
+# ------------------------------------------------------------------------------
+rules:
+  # 1. 规则集拦截
+  - RULE-SET,ads,🛑 广告拦截
+  
+  # 2. 局域网/私有地址直连
+  - GEOSITE,private,DIRECT
+  - GEOIP,private,DIRECT,no-resolve
+
+  # 3. 国内流量直连 (DNS 防泄露关键)
+  - RULE-SET,cn_domain,DIRECT
+  - RULE-SET,cn_ip,DIRECT
+
+  # 4. 国外常见应用走的代理
+  - RULE-SET,geolocation-!cn,🚀 节点选择
+
+  # 5. 兜底规则
+  - GEOIP,cn,DIRECT  # 最后的 GeoIP 中国兜底
+  - MATCH,🐟 漏网之鱼
