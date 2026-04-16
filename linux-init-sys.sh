@@ -7,6 +7,8 @@
 #===============================================================================
 
 set -e  # 遇到错误立即退出
+# 注意：confirm() 函数在用户选 N 时返回 1，因此所有 confirm 调用必须放在
+# `if confirm ...; then` 结构中，否则在 set -e 下会导致脚本意外退出。
 
 # 颜色定义
 RED='\033[0;31m'
@@ -225,7 +227,7 @@ return 1
 fi
 
 # 添加公钥到 authorized_keys
-echo "$pubkey" >> "$auth_keys"
+printf '%s' "$pubkey" >> "$auth_keys"
 
 # 设置正确的权限
 chown -R "$username:$username" "$ssh_dir"
@@ -672,15 +674,15 @@ read -p "最大重试次数（默认 3）: " maxretry
 
 if [[ -n "$bantime" ]]; then
 sed -i "/^\\[DEFAULT\\]/,/^\\[/{s/^bantime = .*/bantime = $bantime/}" "$jail_local"
-sed -i "/^\\[sshd\\]/,/^$/s/^bantime = .*/bantime = $bantime/" "$jail_local"
+sed -i "/^\\[sshd\\]/,/^\\[/{s/^bantime = .*/bantime = $bantime/}" "$jail_local"
 fi
 if [[ -n "$findtime" ]]; then
 sed -i "/^\\[DEFAULT\\]/,/^\\[/{s/^findtime = .*/findtime = $findtime/}" "$jail_local"
-sed -i "/^\\[sshd\\]/,/^$/s/^findtime = .*/findtime = $findtime/" "$jail_local"
+sed -i "/^\\[sshd\\]/,/^\\[/{s/^findtime = .*/findtime = $findtime/}" "$jail_local"
 fi
 if [[ -n "$maxretry" ]]; then
 sed -i "/^\\[DEFAULT\\]/,/^\\[/{s/^maxretry = .*/maxretry = $maxretry/}" "$jail_local"
-sed -i "/^\\[sshd\\]/,/^$/s/^maxretry = .*/maxretry = $maxretry/" "$jail_local"
+sed -i "/^\\[sshd\\]/,/^\\[/{s/^maxretry = .*/maxretry = $maxretry/}" "$jail_local"
 fi
 fi
 
@@ -1159,7 +1161,7 @@ cat >> "$bashrc" << 'EOF'
 # Custom aliases - debian12-setup
 # LS aliases
 alias ll='ls -lh --color=auto'
-alias la='ls -lh --color=auto'
+alias la='ls -lAh --color=auto'
 
 alias l='ls -CF --color=auto'
 alias ls='ls --color=auto'
@@ -1292,11 +1294,9 @@ set wildmenu               " 命令行补全
 " 粘贴模式切换（F2 键）
 set pastetoggle=<F2>
 
-" 鼠标设置
+" 鼠标设置（兼容所有 vim 版本）
 " 禁用鼠标模式，允许终端接管鼠标（解决无法选中复制的问题）
-if has('mouse')
-  set mouse-=a
-endif
+silent! set mouse=
 
 
 " 系统剪贴板（支持和系统互相复制粘贴）
@@ -1354,7 +1354,7 @@ log_info "已备份原配置: $backup"
 fi
 
 # 写入新配置
-echo "$vim_config" > "$vimrc"
+printf '%s\n' "$vim_config" > "$vimrc"
 log_info "已配置: $vimrc"
 
 # 设置权限（如果是用户配置文件）
