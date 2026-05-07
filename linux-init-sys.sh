@@ -215,11 +215,10 @@ local pubkey=""
 local line
 while IFS= read -r line; do
 # 忽略大小写比较
-if [[ "line,," == "end" ]]; then
+if [[ "${line,,}" == "end" ]]; then
 break
 fi
-pubkey+="$line"
-$'\n'
+pubkey+="$line"$'\n'
 done
 
 if [[ -z "$pubkey" ]]; then
@@ -492,6 +491,7 @@ fi
 echo ""
 log_info "更新后的 UFW 规则："
 ufw status | sed 's/^/  /'
+fi
 fi
 
 # 修改 SSH 配置端口
@@ -1421,10 +1421,10 @@ net.ipv4.tcp_max_syn_backlog=8192
 net.ipv4.tcp_fin_timeout=30
 
 # 增大本地端口范围（适合大量出站连接）
-et.ipv4.ip_local_port_range=10240 65535
+net.ipv4.ip_local_port_range=10240 65535
 
 # TCP 窗口优化 (动态计算: 速率 ${speed}Mbps, RTT ~100ms)
-et.ipv4.tcp_rmem=4096 87380 $max_buffer
+net.ipv4.tcp_rmem=4096 87380 $max_buffer
 net.ipv4.tcp_wmem=4096 65536 $max_buffer
 
 # 禁用空闲后的慢启动
