@@ -1433,86 +1433,119 @@ log_info "✓ 环境刷新完成！当前 shell 已立即生效；其他已存�
 optimize_network() {
 log_step "网络优化（BBR 等）"
 
-local kernel
+# ── 收集系统信息 ────────────────────────────────────────────────────────
+local kernel ram_mb cpu_cores interface speed
 kernel=$(uname -r)
-log_info "当前内核版本: $kernel"
+ram_mb=$(free -m | awk '/Mem:/ {print $2}')
+cpu_cores=$(nproc)
 
-# 检查是否支持 BBR
+interface=$(ip route show default | awk '/default/ {print $5}' | head -1)
+speed=1000  # 默认 1Gbps
+if [[ -n "$interface" ]]; then
+    local sys_speed
+    sys_speed=$(cat "/sys/class/net/$interface/speed" 2>/dev/null || echo "")
+    if [[ "$sys_speed" =~ ^[0-9]+$ ]] && [ "$sys_speed" -gt 0 ]; then
+        speed=$sys_speed
+    else
+        log_warn "接口 $interface 未报告有效速率，使用默认值: ${speed}Mbps"
+    fi
+fi
+
+echo ""
+log_info "检测到的系统信息："
+printf "  %-16s: %s\n"  "内核版本"   "$kernel"
+printf "  %-16s: %s MB\n" "物理内存" "$ram_mb"
+printf "  %-16s: %s\n"  "CPU 核心数" "$cpu_cores"
+printf "  %-16s: %s\n"  "主网络接口" "${interface:-未检测到}"
+printf "  %-16s: %s Mbps\n" "接口速率" "$speed"
+echo ""
+
+# ── BBR ────────────────────────────────────────────────────────────────
+# 尝试加载 BBR 模块（内核已静态编译时此命令无副作用）
+modprobe tcp_bbr 2>/dev/null || true
+
 local available
 available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
 if echo "$available" | grep -qw "bbr"; then
-    log_info "检测到内核支持 BBR（tcp_available_congestion_control 中包含 bbr）"
+    log_info "检测到内核支持 BBR"
     if confirm "是否配置并启用 BBR 拥塞控制算法？" "y"; then
         local conf_bbr="/etc/sysctl.d/99-bbr.conf"
-        log_info "写入 BBR 相关内核参数到 $conf_bbr"
         cat > "$conf_bbr" << 'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
         sysctl --system
-
-        log_info "当前拥塞控制算法：$(sysctl -n net.ipv4.tcp_congestion_control)"
-        log_info "当前默认队列：$(sysctl -n net.core.default_qdisc)"
+        log_info "拥塞控制算法 : $(sysctl -n net.ipv4.tcp_congestion_control)"
+        log_info "默认队列规则 : $(sysctl -n net.core.default_qdisc)"
     fi
 else
-    log_warn "当前内核未报告支持 BBR（tcp_available_congestion_control 中没有 bbr），跳过 BBR 配置"
+    log_warn "当前内核不支持 BBR（tcp_available_congestion_control 中没有 bbr），跳过"
 fi
 
-# 额外网络优化（保守参数，适合高并发连接）
-if confirm "是否应用额外网络优化（提高并发连接能力，参数较保守）？" "y"; then
+# ── 动态计算网络调优参数 ────────────────────────────────────────────────
+if confirm "是否应用额外网络优化（根据系统信息动态计算参数）？" "y"; then
+
+    # somaxconn：随内存扩展，上限 65535
+    local somaxconn
+    if   [ "$ram_mb" -ge 8192 ]; then somaxconn=65535
+    elif [ "$ram_mb" -ge 4096 ]; then somaxconn=16384
+    elif [ "$ram_mb" -ge 2048 ]; then somaxconn=8192
+    else somaxconn=4096; fi
+
+    # tcp_max_syn_backlog：somaxconn 的一半
+    local syn_backlog=$(( somaxconn / 2 ))
+
+    # netdev_max_backlog：随接口速率扩展
+    local netdev_backlog
+    if   [ "$speed" -ge 10000 ]; then netdev_backlog=65536
+    elif [ "$speed" -ge 1000  ]; then netdev_backlog=16384
+    elif [ "$speed" -ge 100   ]; then netdev_backlog=4096
+    else netdev_backlog=1000; fi
+
+    # TCP 窗口上限：BDP = 带宽(bytes/s) × RTT(0.1s)
+    # 1 Mbps = 125,000 bytes/s，RTT 基准取 100ms
+    local max_buffer=$(( speed * 125000 / 10 ))
+    [ "$max_buffer" -lt 4194304   ] && max_buffer=4194304    # 最小 4MB
+    [ "$max_buffer" -gt 134217728 ] && max_buffer=134217728  # 最大 128MB
+
+    echo ""
+    log_info "根据系统信息计算出的参数："
+    printf "  %-42s = %-8s  （内存 %sMB）\n"          \
+        "net.core.somaxconn"           "$somaxconn"    "$ram_mb"
+    printf "  %-42s = %-8s  （somaxconn/2）\n"          \
+        "net.ipv4.tcp_max_syn_backlog" "$syn_backlog"
+    printf "  %-42s = %-8s  （接口 %sMbps）\n"          \
+        "net.core.netdev_max_backlog"  "$netdev_backlog" "$speed"
+    printf "  %-42s = %-8s\n"                            \
+        "net.ipv4.tcp_fin_timeout"     "30"
+    printf "  %-42s = %sMB  （BDP @ %sMbps, RTT~100ms）\n" \
+        "net.ipv4.tcp_rmem/wmem max"   "$(( max_buffer/1024/1024 ))" "$speed"
+    printf "  %-42s = %-8s\n"                            \
+        "net.ipv4.ip_local_port_range" "10240 65535"
+    printf "  %-42s = %-8s\n"                            \
+        "net.ipv4.tcp_slow_start_after_idle" "0"
+    echo ""
+
     local conf_net="/etc/sysctl.d/99-net-tuning.conf"
-    log_info "写入网络优化参数到 $conf_net"
-
-    # 动态检测带宽并计算 TCP 窗口大小
-    local default_speed=1000 # 默认 1000Mbps
-    local speed=$default_speed
-    local interface=""
-    
-    # 尝试检测主接口
-    interface=$(ip route show default | awk '/default/ {print $5}' | head -1)
-    if [[ -n "$interface" ]]; then
-        local sys_speed_path="/sys/class/net/$interface/speed"
-        if [[ -f "$sys_speed_path" ]]; then
-            local detect_speed=$(cat "$sys_speed_path" 2>/dev/null || echo "")
-            # 只有当检测到的速度大于 0 时才采用（排除 -1 或 0）
-            if [[ "$detect_speed" =~ ^[0-9]+$ ]] && [ "$detect_speed" -gt 0 ]; then
-                speed=$detect_speed
-                log_info "检测到网络接口 $interface 速率: ${speed}Mbps"
-            else
-                log_warn "接口 $interface 未报告有效速率，使用默认值: ${speed}Mbps"
-            fi
-        fi
-    fi
-
-    # 计算窗口大小 (以 100ms RTT 为基准)
-    # BDP = Bandwidth (bytes/sec) * RTT (sec)
-    # 1 Mbps = 125,000 bytes/sec
-    # Buffer = speed * 125000 * 0.1
-    local max_buffer=$((speed * 125000 / 10))
-    if [ "$max_buffer" -lt 4194304 ]; then max_buffer=4194304; fi # 最小 4MB
-    if [ "$max_buffer" -gt 134217728 ]; then max_buffer=134217728; fi # 最大 128MB
-    
-    log_info "根据速率 (${speed}Mbps) 计算 TCP 窗口最大值: $((max_buffer/1024/1024))MB"
-
     cat > "$conf_net" << EOF
-# 提高监听队列
-net.core.somaxconn=4096
-net.core.netdev_max_backlog=16384
+# 监听队列（随内存 ${ram_mb}MB 动态计算）
+net.core.somaxconn=$somaxconn
+net.core.netdev_max_backlog=$netdev_backlog
 
-# 提高半连接队列
-net.ipv4.tcp_max_syn_backlog=8192
+# 半连接队列（somaxconn/2）
+net.ipv4.tcp_max_syn_backlog=$syn_backlog
 
-# 减少 TIME_WAIT 持续时间
+# TIME_WAIT 回收（高并发场景）
 net.ipv4.tcp_fin_timeout=30
 
-# 增大本地端口范围（适合大量出站连接）
+# 本地端口范围（适合大量出站连接）
 net.ipv4.ip_local_port_range=10240 65535
 
-# TCP 窗口优化 (动态计算: 速率 ${speed}Mbps, RTT ~100ms)
+# TCP 窗口（BDP: 速率 ${speed}Mbps, RTT ~100ms）
 net.ipv4.tcp_rmem=4096 87380 $max_buffer
 net.ipv4.tcp_wmem=4096 65536 $max_buffer
 
-# 禁用空闲后的慢启动
+# 禁用空闲后的慢启动（服务器场景）
 net.ipv4.tcp_slow_start_after_idle=0
 EOF
 
@@ -1520,7 +1553,7 @@ EOF
     log_info "网络优化参数已应用"
 fi
 
-log_info "网络优化完成（已针对代理/高并发场景进行调整）"
+log_info "网络优化完成"
 }
 
 #===============================================================================
