@@ -195,7 +195,8 @@ log_error "用户 $username 不存在"
 return 1
 fi
 
-local user_home=$(eval echo ~$username)
+local user_home
+user_home=$(getent passwd "$username" | cut -d: -f6)
 local ssh_dir="$user_home/.ssh"
 local auth_keys="$ssh_dir/authorized_keys"
 
@@ -677,12 +678,12 @@ sed -i "/^\\[DEFAULT\\]/,/^\\[/{s/^bantime = .*/bantime = $bantime/}" "$jail_loc
 sed -i "/^\\[sshd\\]/,/^\\[/{s/^bantime = .*/bantime = $bantime/}" "$jail_local"
 fi
 if [[ -n "$findtime" ]]; then
-sed -i "/^\\[DEFAULT\\]/,/^\\/{s/^findtime = .*/findtime = $findtime/}" "$jail_local"
-sed -i "/^\\[sshd\\]/,/^\\/{s/^findtime = .*/findtime = $findtime/}" "$jail_local"
+sed -i "/^\\[DEFAULT\\]/,/^\\[/{s/^findtime = .*/findtime = $findtime/}" "$jail_local"
+sed -i "/^\\[sshd\\]/,/^\\[/{s/^findtime = .*/findtime = $findtime/}" "$jail_local"
 fi
 if [[ -n "$maxretry" ]]; then
-sed -i "/^\\[DEFAULT\\]/,/^\\/{s/^maxretry = .*/maxretry = $maxretry/}" "$jail_local"
-sed -i "/^\\[sshd\\]/,/^\\/{s/^maxretry = .*/maxretry = $maxretry/}" "$jail_local"
+sed -i "/^\\[DEFAULT\\]/,/^\\[/{s/^maxretry = .*/maxretry = $maxretry/}" "$jail_local"
+sed -i "/^\\[sshd\\]/,/^\\[/{s/^maxretry = .*/maxretry = $maxretry/}" "$jail_local"
 fi
 fi
 
@@ -1049,7 +1050,8 @@ log_error "用户 $username 不存在，跳过"
 continue
 fi
 target_users+=("$username")
-local user_home=$(eval echo ~"$username")
+local user_home
+user_home=$(getent passwd "$username" | cut -d: -f6)
 bashrc_files+=("$user_home/.bashrc")
 vimrc_files+=("$user_home/.vimrc")
 done
@@ -1131,7 +1133,7 @@ if [[ -f "$bashrc" ]]; then
 echo ""
 echo "文件: $bashrc"
 echo "----------------------------------------"
-grep "^alias\|^#alias" "$bashrc" | grep -A 50 "debian12-setup" | head -20
+grep -A 50 "# Custom aliases - debian12-setup" "$bashrc" | grep "alias" | head -20
 fi
 done
 return
@@ -1266,13 +1268,14 @@ log_info "已备份原配置: $backup"
 fi
 
 # 写入新配置
-printf '%s\n' "$vim_config" > "$vimrc"
+printf '%b' "$vim_config" > "$vimrc"
 log_info "已配置: $vimrc"
 
 # 设置权限（如果是用户配置文件）
 if [[ "$scope_choice" == "2" ]]; then
 for username in "${target_users[@]}"; do
-local user_home=$(eval echo ~$username)
+local user_home
+user_home=$(getent passwd "$username" | cut -d: -f6)
 if [[ "$vimrc" == "$user_home/.vimrc" ]]; then
 chown "$username:$username" "$vimrc"
 chmod 644 "$vimrc"
