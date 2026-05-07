@@ -1547,3 +1547,65 @@ fi
     fi
 }
 
+#===============================================================================
+# 主菜单
+#===============================================================================
+show_menu() {
+echo -e "\n${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║           Debian 12 系统初始化配置脚本                       ║${NC}"
+echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo "  1)  系统更新"
+echo "  2)  安装 Docker"
+echo "  3)  新建用户"
+echo "  4)  添加 SSH 密钥"
+echo "  5)  安装常用工具"
+echo "  6)  配置时区"
+echo "  7)  配置 UFW 防火墙"
+echo "  8)  配置 SSH 安全设置"
+echo "  9)  安装配置 Fail2ban"
+echo "  10) 配置 SSH 登录欢迎信息"
+echo "  11) 用户环境配置优化"
+echo "  12) 网络优化（BBR 等）"
+echo "  13) 检查并配置 Swap"
+echo "  0)  退出"
+echo ""
+}
+
+main() {
+check_root
+
+while true; do
+show_menu
+read -p "请选择操作 [0-13]: " choice
+
+case $choice in
+1)  update_system ;;
+2)  install_docker ;;
+3)  create_user ;;
+4)  add_ssh_key ;;
+5)  install_common_tools ;;
+6)  configure_timezone ;;
+7)  configure_ufw ;;
+8)  configure_ssh ;;
+9)  install_fail2ban ;;
+10) configure_ssh_motd ;;
+11) configure_user_environment ;;
+12) optimize_network ;;
+13) configure_swap ;;
+0)
+log_info "退出脚本"
+exit 0
+;;
+*)
+log_warn "无效的选择，请输入 0-13"
+;;
+esac
+
+echo ""
+read -p "按 Enter 键返回主菜单..." _
+done
+}
+
+main "$@"
+
