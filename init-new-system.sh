@@ -40,14 +40,22 @@ SSH_END='# END properties-script ssh include'
 UFW_AFTER_RULES=/etc/ufw/after.rules
 UFW_DOCKER_BEGIN='# BEGIN properties-script ufw-docker'
 UFW_DOCKER_END='# END properties-script ufw-docker'
+# 本次运行改过别名/EDITOR 时记录范围，退出菜单时再次提示刷新父终端。
+ENV_REFRESH_SCOPE=
 MANAGED_ALIAS_NAMES='ll la l ls grep egrep fgrep df free du rm cp mv .. ... .... mkdir wget path now ports'
 # 与 optimize-vps.sh 共用同一把锁；放在仅 root 可写的 /run，避免 /run/lock 中的符号链接攻击。
 LOCK_FILE=/run/properties-script.lock
 
-log_info() { printf '[INFO] %s\n' "$*"; }
-log_warn() { printf '[WARN] %s\n' "$*" >&2; }
-log_error() { printf '[ERROR] %s\n' "$*" >&2; }
-log_step() { printf '\n==== %s ====\n' "$*"; }
+# 仅在终端中着色；NO_COLOR 或重定向到文件时输出纯文本。
+if [[ -t 1 && -t 2 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+    C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_RED=$'\e[31m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_CYAN=$'\e[36m'
+else
+    C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+fi
+log_info() { printf '%s[INFO]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+log_warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+log_error() { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+log_step() { printf '\n%s==== %s ====%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
 ask() { IFS= read -r -p "$1" "$2" || { log_warn '输入结束，取消当前操作'; return 1; }; }
 confirm() {
     local response prompt="$1" default="${2:-n}"
@@ -401,13 +409,21 @@ install_common_tools() {
     confirm '安装 vim/git/curl/htop/tmux/网络工具/sudo 等常用软件？' y || return 0
     apt_install "${packages[@]}"
 }
-configure_timezone() {
+current_timezone() {
     local timezone
+    timezone=$(timedatectl show -p Timezone --value 2>/dev/null)
+    [[ -n "$timezone" ]] || timezone=$(readlink /etc/localtime 2>/dev/null | sed 's|^.*/zoneinfo/||')
+    printf '%s\n' "${timezone:-UTC}"
+}
+configure_timezone() {
+    local timezone current
     log_step '时区'
-    ask '时区 [Asia/Shanghai]: ' timezone || return 1
-    timezone="${timezone:-Asia/Shanghai}"
+    current=$(current_timezone)
+    ask "时区 [${current}]: " timezone || return 1
+    timezone="${timezone:-$current}"
     [[ "$timezone" != /* && "$timezone" != *..* && -f "/usr/share/zoneinfo/$timezone" ]] || { log_error '无效时区'; return 1; }
-    confirm "设置时区为 ${timezone}？" || return 0
+    [[ "$timezone" != "$current" ]] || { log_info "保持当前时区 ${current}"; return 0; }
+    confirm "设置时区为 ${timezone}？" y || return 0
     timedatectl set-timezone "$timezone"
 }
 # socket 激活或 ssh.service 未运行时 /run/sshd 可能不存在，sshd -t/-T 会报 Missing privilege separation directory。
@@ -719,7 +735,7 @@ wait_fail2ban() {
     return 1
 }
 install_fail2ban() {
-    local ports temp bantime=3600 findtime=600 maxretry=3 backend
+    local ports temp bantime=86400 findtime=600 maxretry=3 backend
     log_step '配置 Fail2ban'
     require_commands sshd ss || return 1
     command -v fail2ban-client >/dev/null 2>&1 || apt_install fail2ban || return 1
@@ -727,7 +743,7 @@ install_fail2ban() {
     [[ -n "$ports" ]] || return 1
     backend=systemd
     if [[ -f /var/log/auth.log ]]; then backend=auto; else apt_install python3-systemd || return 1; fi
-    if confirm '修改默认封禁参数（3600秒/600秒/3次）？'; then
+    if confirm '修改默认封禁参数（封禁86400秒/统计窗口600秒/失败3次）？'; then
         ask '封禁秒数: ' bantime || return 1
         valid_uint "$bantime" 1 2147483647 || { log_error '封禁秒数须为正整数'; return 1; }
         ask '统计窗口秒数: ' findtime || return 1
@@ -882,7 +898,8 @@ configure_user_environment() {
     local scope user_input username home bashrc vimrc owner action edit_vim edit_editor temp vim_path
     local users=() bashrcs=() vimrcs=() owners=()
     log_step '用户环境（别名、编辑器、Vim 分别独立处理）'
-    ask '范围：1=全局，2=指定用户: ' scope || return 1
+    ask '范围：1=全局，2=指定用户 [1]: ' scope || return 1
+    scope="${scope:-1}"
     case "$scope" in
         1) bashrcs+=("$GLOBAL_BASHRC"); vimrcs+=("$GLOBAL_VIMRC"); owners+=('') ;;
         2)
@@ -897,10 +914,11 @@ configure_user_environment() {
             done ;;
         *) log_error '范围无效'; return 1 ;;
     esac
-    ask '别名：1=启用/更新，2=禁用，3=查看，0=跳过: ' action || return 1
+    ask '别名：1=启用/更新，2=禁用，3=查看，0=跳过 [1]: ' action || return 1
+    action="${action:-1}"
     [[ "$action" =~ ^[0123]$ ]] || { log_error '选择无效'; return 1; }
     edit_editor=no; edit_vim=no
-    if confirm '设置默认编辑器为 Vim？'; then edit_editor=yes; fi
+    if confirm '设置默认编辑器为 Vim？' y; then edit_editor=yes; fi
     if confirm '配置 SSH 友好的 Vim 默认设置？' y; then edit_vim=yes; fi
     if [[ "$edit_editor" == yes || "$edit_vim" == yes ]]; then
         command -v vim >/dev/null 2>&1 || apt_install vim || return 1
@@ -943,23 +961,105 @@ configure_user_environment() {
         fi
     fi
     if [[ "$scope" == 1 && "$action" == 1 ]]; then report_alias_overrides; fi
-    if [[ "$action" == 1 || "$action" == 2 || "$edit_editor" == yes ]]; then print_environment_refresh "$scope"; fi
+    if [[ "$action" == 1 || "$action" == 2 || "$edit_editor" == yes ]]; then
+        print_environment_refresh "$scope"
+        ENV_REFRESH_SCOPE="$scope"
+    fi
     log_info "环境配置完成，备份: ${BACKUP_DIR}；Vim 重开后加载。"
 }
 run_all() {
     local step
     confirm '执行全部操作？每个敏感步骤仍将单独确认。' || return 0
     # 先确认 SSH 最终端口，再创建 Fail2ban jail，避免封禁错端口。
-    for step in update_system install_common_tools configure_timezone install_docker create_user add_ssh_key configure_user_environment configure_ssh_motd configure_ssh configure_ufw install_fail2ban; do
+    for step in "${MENU_STEPS[@]}"; do
         "$step" || { trap - HUP INT TERM; log_error "步骤 $step 失败，停止全部操作；不会继续加固或自动重启"; return 1; }
         trap - HUP INT TERM
     done
     log_info '全部步骤完成。请验证新会话、sudo、容器网络和防火墙，再安排重启。'
 }
-show_menu() {
-    printf '\nDebian/Ubuntu 初始化\n'
-    printf '%s\n' '1 更新系统' '2 安装 Docker' '3 创建用户' '4 添加 SSH 公钥' '5 安装常用工具' '6 时区' '7 UFW' '8 SSH 安全/端口' '9 Fail2ban' '10 SSH 欢迎信息' '11 用户环境/别名/Vim' 'a 全部操作' '0 退出'
+# 菜单状态标记：✓ 已就绪，! 需要注意，○ 未配置；纯文本为当前值。
+status_ok() { printf '%s✓ %s%s' "$C_GREEN" "$1" "$C_RESET"; }
+status_warn() { printf '%s! %s%s' "$C_YELLOW" "$1" "$C_RESET"; }
+status_off() { printf '%s○ %s%s' "$C_DIM" "$1" "$C_RESET"; }
+# 按终端显示宽度补齐（中文占两列）；C.UTF-8 保证 ${#s} 按字符而非字节计数。
+pad_label() {
+    local LC_ALL=C.UTF-8 s="$1" ascii
+    ascii="${s//[^[:ascii:]]/}"
+    printf '%s%*s' "$s" $(( $2 - ${#ascii} - 2 * (${#s} - ${#ascii}) )) ''
 }
+normal_users() { getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ {print $1}'; }
+menu_status() {
+    local missing=0 cmd names ports banned username home
+    case "$1" in
+        update_system) [[ ! -f /var/run/reboot-required ]] || status_warn '待重启' ;;
+        install_common_tools)
+            for cmd in vim git curl htop tmux tree; do command -v "$cmd" >/dev/null 2>&1 || missing=$((missing + 1)); done
+            if (( missing == 0 )); then status_ok '已安装'; else status_off "缺 ${missing} 项"; fi ;;
+        configure_timezone) current_timezone ;;
+        install_docker)
+            if ! command -v docker >/dev/null 2>&1; then status_off '未安装'
+            elif systemctl is-active --quiet docker; then status_ok '运行中'
+            else status_warn '未运行'; fi ;;
+        create_user)
+            names=$(normal_users | paste -sd, - | sed 's/,/, /g')
+            if [[ -n "$names" ]]; then printf '%s' "$names"; else status_off '无普通用户'; fi ;;
+        add_ssh_key)
+            names=$( { printf 'root\n'; normal_users; } | while read -r username; do
+                home=$(user_home "$username")
+                [[ ! -s "$home/.ssh/authorized_keys" ]] || printf '%s\n' "$username"
+            done | paste -sd, - | sed 's/,/, /g')
+            if [[ -n "$names" ]]; then status_ok "$names"; else status_off '无公钥'; fi ;;
+        configure_user_environment)
+            if awk -v b="$ALIASES_BEGIN" -v e="$ALIASES_END" '$0==b {i=1} $0==e {i=0} i && /^alias / {f=1} END {exit !f}' "$GLOBAL_BASHRC" 2>/dev/null; then
+                status_ok '全局别名'
+            else
+                status_off '未配置'
+            fi ;;
+        configure_ssh_motd)
+            if [[ -x "$MOTD_FILE" ]]; then status_ok '已启用'; else status_off '未启用'; fi ;;
+        configure_ssh)
+            ports=$(ssh_entry_ports 2>/dev/null | paste -sd, -)
+            if [[ -f "$SSH_MANAGED" ]] && grep -qxF "$SSH_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
+                status_ok "已加固 · 端口 ${ports:-?}"
+            else
+                status_off "未加固 · 端口 ${ports:-?}"
+            fi ;;
+        configure_ufw)
+            if ! command -v ufw >/dev/null 2>&1; then status_off '未安装'
+            elif ufw_active; then status_ok '已启用'
+            else status_warn '未启用'; fi ;;
+        install_fail2ban)
+            if ! command -v fail2ban-client >/dev/null 2>&1; then status_off '未安装'
+            elif systemctl is-active --quiet fail2ban; then
+                banned=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/ {gsub(/[[:space:]]/, "", $2); print $2}')
+                status_ok "运行中${banned:+ · 封禁 ${banned}}"
+            else
+                status_warn '未运行'
+            fi ;;
+    esac
+}
+# 编号即 run_all 的推荐执行顺序；修改时与 MENU_STEPS、run_all 保持一致。
+MENU_STEPS=(update_system install_common_tools configure_timezone install_docker create_user add_ssh_key configure_user_environment configure_ssh_motd configure_ssh configure_ufw install_fail2ban)
+MENU_LABELS=('更新系统' '常用工具' '时区' 'Docker' '创建用户' 'SSH 公钥' '别名 / 编辑器 / Vim' 'SSH 欢迎信息' 'SSH 加固 / 端口' 'UFW 防火墙' 'Fail2ban')
+show_menu() {
+    local i os rule
+    os=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-$ID}")
+    rule=$(printf '%.0s─' {1..52})
+    printf '\n  %sDebian/Ubuntu 初始化%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s%s · %s · 内核 %s%s\n' "$C_DIM" "$(hostname)" "$os" "$(uname -r)" "$C_RESET"
+    printf '  %s%s%s\n' "$C_DIM" "$rule" "$C_RESET"
+    for i in "${!MENU_STEPS[@]}"; do
+        case "$i" in
+            0) printf '\n  %s系统%s\n' "$C_CYAN" "$C_RESET" ;;
+            4) printf '\n  %s用户%s\n' "$C_CYAN" "$C_RESET" ;;
+            8) printf '\n  %s安全%s\n' "$C_CYAN" "$C_RESET" ;;
+        esac
+        printf '   %s%2d%s  %s  %s\n' "$C_BOLD" $((i + 1)) "$C_RESET" "$(pad_label "${MENU_LABELS[$i]}" 20)" "$(menu_status "${MENU_STEPS[$i]}")"
+    done
+    printf '\n  %s%s%s\n' "$C_DIM" "$rule" "$C_RESET"
+    printf '   %s a%s  按顺序执行全部       %s 0%s  退出\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+}
+exit_menu() { [[ -z "$ENV_REFRESH_SCOPE" ]] || print_environment_refresh "$ENV_REFRESH_SCOPE"; }
 main() {
     local choice step
     case "${1:-}" in
@@ -974,12 +1074,16 @@ main() {
     detect_ssh_connection
     while true; do
         show_menu
-        ask '选择: ' choice || return 0
+        ask "$(printf '\n  %s选择 [1-%d/a/0]:%s ' "$C_BOLD" "${#MENU_STEPS[@]}" "$C_RESET")" choice || { exit_menu; return 0; }
         case "$choice" in
-            1) step=update_system ;; 2) step=install_docker ;; 3) step=create_user ;; 4) step=add_ssh_key ;;
-            5) step=install_common_tools ;; 6) step=configure_timezone ;; 7) step=configure_ufw ;; 8) step=configure_ssh ;;
-            9) step=install_fail2ban ;; 10) step=configure_ssh_motd ;; 11) step=configure_user_environment ;; a|A) step=run_all ;;
-            0) return 0 ;; *) log_warn '选择无效'; continue ;;
+            a|A) step=run_all ;;
+            0) exit_menu; return 0 ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]{1,2}$ ]] && (( 10#$choice >= 1 && 10#$choice <= ${#MENU_STEPS[@]} )); then
+                    step="${MENU_STEPS[10#$choice - 1]}"
+                else
+                    log_warn '选择无效'; continue
+                fi ;;
         esac
         if ! "$step"; then log_error "操作 $step 失败。请检查以上错误及备份；已返回菜单，不会自动继续。"; fi
         trap - HUP INT TERM
