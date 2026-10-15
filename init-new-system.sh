@@ -248,19 +248,30 @@ update_block() {
 }
 apt_install() { apt_get update && apt_get install -y -- "$@"; }
 update_system() {
+    local plan upgrade=yes
     log_step '系统更新'
     apt_get update || return 1
-    apt_get -s full-upgrade || return 1
-    confirm '以上升级可能移除软件包，确认执行？' || return 0
-    # 已修改的配置（如带本脚本 Include 的 sshd_config）一律保留本地版本，避免升级时选错而静默丢失加固项。
-    UCF_FORCE_CONFFOLD=1 apt_get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade -y || return 1
-    if [[ -f "$SSH_MANAGED" ]] && ! grep -qxF "$SSH_BEGIN" "$SSH_CONFIG"; then
-        log_warn 'sshd_config 中本脚本的 Include 区块已丢失，SSH 加固未生效；请重新执行 SSH 安全配置'
+    # 先模拟：无变更直接跳过；仅当升级会移除软件包时才列出并确认（Inst/Remv 为 apt 固定输出，不随语言变化）。
+    plan=$(apt_get -s full-upgrade) || return 1
+    if ! grep -q '^Inst \|^Remv ' <<< "$plan"; then
+        log_info '系统已是最新'
+        upgrade=no
+    elif grep -q '^Remv ' <<< "$plan"; then
+        grep '^Remv ' <<< "$plan"
+        confirm '以上软件包将在升级中被移除，确认执行？' y || upgrade=no
     fi
-    log_info '已保留本地修改过的配置文件；维护者新版本通常保存为 *.dpkg-dist / *.ucf-dist，可人工比对'
-    if confirm '是否预览并清理不再需要的软件包？'; then
-        apt_get -s autoremove || return 1
-        if confirm '确认清理？'; then apt_get autoremove -y || return 1; fi
+    if [[ "$upgrade" == yes ]]; then
+        # 已修改的配置（如带本脚本 Include 的 sshd_config）一律保留本地版本，避免升级时选错而静默丢失加固项。
+        UCF_FORCE_CONFFOLD=1 apt_get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade -y || return 1
+        if [[ -f "$SSH_MANAGED" ]] && ! grep -qxF "$SSH_BEGIN" "$SSH_CONFIG"; then
+            log_warn 'sshd_config 中本脚本的 Include 区块已丢失，SSH 加固未生效；请重新执行 SSH 安全配置'
+        fi
+        log_info '已保留本地修改过的配置文件；维护者新版本通常保存为 *.dpkg-dist / *.ucf-dist，可人工比对'
+    fi
+    plan=$(apt_get -s autoremove) || return 1
+    if grep -q '^Remv ' <<< "$plan"; then
+        grep '^Remv ' <<< "$plan"
+        if confirm '以上软件包已不再需要，确认清理？' y; then apt_get autoremove -y || return 1; fi
     fi
     apt_get autoclean || return 1
     [[ ! -f /var/run/reboot-required ]] || log_warn '系统提示需要重启，请安排维护窗口'
