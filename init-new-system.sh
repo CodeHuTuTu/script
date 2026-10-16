@@ -451,6 +451,29 @@ configure_timezone() {
 swap_active() { awk -v f="$1" 'NR > 1 && $1 == f {found=1} END {exit !found}' /proc/swaps 2>/dev/null; }
 swap_managed() { [[ -f "$FSTAB" ]] && grep -qxF "$SWAP_BEGIN" "$FSTAB"; }
 fmt_mib() { awk -v m="$1" 'BEGIN {if (m >= 1024) printf "%.1fG", m / 1024; else printf "%dM", m}'; }
+mem_total_mib() { awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo; }
+# 推荐 swap 总量：内存 <2G 取 2 倍，2–8G 与内存相同，≥8G 取 4G（不考虑休眠）；按 256MiB 向上取整。
+swap_recommend_mib() {
+    local r
+    if (( $1 < 2048 )); then r=$(( $1 * 2 )); elif (( $1 < 8192 )); then r=$1; else r=4096; fi
+    printf '%d\n' $(( (r + 255) / 256 * 256 ))
+}
+# 已启用的 swap 总量（MiB，向上取整：/proc/swaps 比文件少一页头），传入路径时不计该项。
+swap_total_mib() { awk -v f="${1:-}" 'NR > 1 && $1 != f {s += $3} END {printf "%d", (s + 1023) / 1024}' /proc/swaps; }
+# 差额按 256MiB 四舍五入，避免提示“增加 1M”这类无意义的建议。
+swap_advice() {
+    local mem total rec need
+    mem=$(mem_total_mib)
+    valid_uint "$mem" 1 2147483647 || return 0
+    total=$(swap_total_mib)
+    rec=$(swap_recommend_mib "$mem")
+    need=$(( (rec - total + 128) / 256 * 256 ))
+    if (( need <= 0 )); then
+        log_info "当前内存 $(fmt_mib "$mem")，已有 swap $(fmt_mib "$total")（建议 $(fmt_mib "$rec")），无需增加虚拟内存"
+    else
+        log_info "当前内存 $(fmt_mib "$mem")，已有 swap $(fmt_mib "$total")，建议增加 $(fmt_mib "$need")（总量约 $(fmt_mib "$rec")）"
+    fi
+}
 # 1024 / 1024M / 2G → MiB
 parse_size_mib() {
     [[ "$1" =~ ^([0-9]{1,7})([MmGg]?)$ ]] || return 1
@@ -498,7 +521,7 @@ setup_swap_file() {
         btrfs) log_error 'btrfs 上的 swap 文件需禁用 CoW（可用 btrfs filesystem mkswapfile），本脚本不自动处理'; return 1 ;;
         *) log_error "不支持在 ${fs} 文件系统上自动创建 swap 文件"; return 1 ;;
     esac
-    mem=$(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo)
+    mem=$(mem_total_mib)
     valid_uint "$mem" 1 2147483647 || { log_error '无法读取物理内存容量'; return 1; }
     [[ ! -f "$SWAP_FILE" ]] || current=$(( $(stat -c %s -- "$SWAP_FILE") / 1048576 ))
     avail=$(df -P -m -- "$dir" | awk 'NR == 2 {print $4}')
@@ -506,9 +529,9 @@ setup_swap_file() {
     # 调整大小时旧文件会先删除，其空间计入可用。
     max=$(( 10#$avail + current - SWAP_RESERVE_MIB ))
     (( max >= SWAP_MIN_MIB )) || { log_error "磁盘可用 ${avail}MiB，保留 ${SWAP_RESERVE_MIB}MiB 后不足以创建 swap"; return 1; }
-    # 推荐值：内存 <2G 取 2 倍，2–8G 与内存相同，≥8G 取 4G（不考虑休眠）；按 256MiB 向上取整，受磁盘上限约束。
-    if (( mem < 2048 )); then default=$(( mem * 2 )); elif (( mem < 8192 )); then default=$mem; else default=4096; fi
-    default=$(( (default + 255) / 256 * 256 ))
+    # 默认值：推荐总量减去其他已启用的 swap（至少 256MiB），受磁盘上限约束。
+    default=$(( ($(swap_recommend_mib "$mem") - $(swap_total_mib "$SWAP_FILE") + 128) / 256 * 256 ))
+    (( default >= 256 )) || default=256
     (( default <= max )) || default=$(( max / 256 * 256 ))
     (( default >= SWAP_MIN_MIB )) || default=$max
     log_info "物理内存 ${mem}MiB；${dir} 可用 ${avail}MiB，可分配上限 ${max}MiB（保留 ${SWAP_RESERVE_MIB}MiB）"
@@ -583,6 +606,7 @@ configure_swap() {
     [[ -r /proc/swaps ]] || { log_error '内核未提供 /proc/swaps'; return 1; }
     if awk 'NR > 1 {found=1} END {exit !found}' /proc/swaps; then swapon --show; else log_info '当前没有启用的 swap'; fi
     printf 'vm.swappiness = %s\n' "$(sysctl -n vm.swappiness)"
+    swap_advice
     if [[ -L "$SWAP_FILE" || ( -e "$SWAP_FILE" && ! -f "$SWAP_FILE" ) ]]; then log_error "$SWAP_FILE 不是普通文件"; return 1; fi
     if [[ -e "$SWAP_FILE" ]] && ! swap_managed; then
         log_error "$SWAP_FILE 已存在但不由本脚本管理；请先人工 swapoff 并删除它及 fstab 条目"; return 1
