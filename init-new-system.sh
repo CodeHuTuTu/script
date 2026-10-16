@@ -622,6 +622,55 @@ configure_swap() {
         *) log_error '选择无效'; return 1 ;;
     esac
 }
+# 白名单项（SSH AllowUsers / Fail2ban ignoreip）：IPv4/IPv6 地址或 CIDR 网段。
+valid_ip_or_cidr() {
+    local addr="${1%%/*}" max octet
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        max=32
+        for octet in "${BASH_REMATCH[@]:1:4}"; do (( 10#$octet <= 255 )) || return 1; done
+    elif [[ "$addr" == *:* && "$addr" =~ ^[0-9A-Fa-f:]+$ ]]; then
+        max=128
+    else
+        return 1
+    fi
+    [[ "$1" != */* ]] || valid_uint "${1#*/}" 0 "$max"
+}
+# 读取空格/逗号分隔的 IP 列表写入变量 $1：留空保留当前值 $3，- 清空；$4 为当前无值时留空的含义。
+read_ip_list() {
+    local input entry list entries=()
+    if [[ -n "$3" ]]; then
+        ask "$2（空格或逗号分隔；留空保留 $3，- 清空）: " input || return 1
+    else
+        ask "$2（空格或逗号分隔，留空$4）: " input || return 1
+    fi
+    list=$3
+    if [[ "$input" == - ]]; then
+        list=''
+    elif [[ -n "$input" ]]; then
+        read -r -a entries <<< "${input//,/ }"
+        for entry in "${entries[@]}"; do valid_ip_or_cidr "$entry" || { log_error "无效的 IP/网段: $entry"; return 1; }; done
+        list=$(printf '%s\n' "${entries[@]}" | awk '!seen[$0]++' | paste -sd' ' -)
+    fi
+    printf -v "$1" '%s' "$list"
+}
+ipv4_int() { local IFS=. a b c d; read -r a b c d <<< "$1"; printf '%d\n' $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d )); }
+# IPv4 按 CIDR 判断；IPv6 只认精确地址（写法多样，网段交给调用方人工确认）。
+ip_in_list() {
+    local entry bits mask
+    for entry in $2; do
+        [[ "$entry" != "$1" && "$entry" != "$1/32" && "$entry" != "$1/128" ]] || return 0
+        [[ "$1" != *:* && "$entry" != *:* ]] || continue
+        bits=32; [[ "$entry" != */* ]] || bits=$((10#${entry#*/}))
+        mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+        (( ($(ipv4_int "$1") & mask) == ($(ipv4_int "${entry%/*}") & mask) )) && return 0
+    done
+    return 1
+}
+# 本脚本写入的 AllowUsers 只含 *@地址 形式。
+ssh_whitelist() {
+    [[ -f "$SSH_MANAGED" ]] || return 0
+    awk '$1 == "AllowUsers" {for (i = 2; i <= NF; i++) {sub(/^\*@/, "", $i); printf "%s%s", (n++ ? " " : ""), $i}} END {if (n) print ""}' "$SSH_MANAGED"
+}
 # socket 激活或 ssh.service 未运行时 /run/sshd 可能不存在，sshd -t/-T 会报 Missing privilege separation directory。
 prepare_sshd() { [[ -d /run/sshd ]] || install -d -m 0755 /run/sshd; }
 ssh_effective() { prepare_sshd && sshd -T -f "$SSH_CONFIG" "$@"; }
@@ -795,7 +844,7 @@ rollback_ssh() {
 }
 configure_ssh() {
     local new_port old_ports ports port admin_user='' disable_root=no disable_password=no extra=no
-    local temp main_clean expected config actual key attempt listener type root_shell client_ip
+    local temp main_clean expected config actual key attempt listener type root_shell client_ip allow_ips effective_allow
     local socket_tokens=()
     log_step 'SSH 安全配置（端口迁移保留旧入口）'
     require_commands sshd ss ssh-keygen || return 1
@@ -821,6 +870,22 @@ configure_ssh() {
         confirm '确认已在第二个终端用公钥登录此用户并成功执行 sudo -i，且控制台可用？' || return 0
     fi
     if confirm '禁用空密码/X11，并设置 MaxAuthTries=3？'; then extra=yes; fi
+    # AllowUsers *@地址：白名单外的来源无论哪个用户都无法通过认证。
+    client_ip=${SSH_CONNECTION%% *}
+    [[ -z "$client_ip" ]] || log_info "当前 SSH 来源 IP: ${client_ip}"
+    read_ip_list allow_ips '仅允许以下 IP/网段登录 SSH' "$(ssh_whitelist)" '不限制' || return 1
+    if [[ -n "$allow_ips" ]]; then
+        log_warn '启用后白名单外的 IP 将无法登录；动态 IP 变化后只能通过控制台恢复。'
+        if [[ -z "$client_ip" ]]; then
+            confirm '未检测到当前 SSH 来源，确认控制台可用且白名单包含你的出口 IP？' || return 0
+        elif ! ip_in_list "$client_ip" "$allow_ips"; then
+            if [[ "$client_ip" == *:* ]]; then
+                confirm "无法自动判断 IPv6 ${client_ip} 是否在白名单网段内，确认已包含？" || return 0
+            else
+                log_error "当前来源 ${client_ip} 不在白名单内，继续会把自己锁在外面"; return 1
+            fi
+        fi
+    fi
     if [[ -n "$new_port" && ! -f "$FAIL2BAN_CONFIG" ]] && command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
         log_warn '现有 Fail2ban jail 不由本脚本管理，无法安全自动修改。'
         confirm '确认将人工同步已有 jail 到新端口？否则请先运行本脚本的 Fail2ban 配置' || return 0
@@ -841,8 +906,9 @@ configure_ssh() {
     ports="$old_ports"
     if [[ -n "$new_port" ]]; then ports=$(printf '%s\n%s\n' "$old_ports" "$new_port" | sort -nu) || return 1; fi
     config=$(mktemp "$BACKUP_DIR/ssh-desired.XXXXXX") || return 1
-    awk '!/^[[:space:]]*Port[[:space:]]/' "$temp" > "$config" || return 1
+    awk '!/^[[:space:]]*(Port|AllowUsers)[[:space:]]/' "$temp" > "$config" || return 1
     for port in $ports; do printf 'Port %s\n' "$port" >> "$config" || return 1; done
+    if [[ -n "$allow_ips" ]]; then printf 'AllowUsers %s\n' "$(printf '*@%s\n' $allow_ips | paste -sd' ' -)" >> "$config" || return 1; fi
     # 新选择的单值配置必须放在专属文件最前面。
     : > "$temp" || return 1
     if [[ "$disable_root" == yes ]]; then printf 'PermitRootLogin no\n' >> "$temp" || return 1; fi
@@ -856,7 +922,6 @@ configure_ssh() {
     if ! sshd -t -f "$SSH_CONFIG"; then restore_files; return 1; fi
     expected=$(mktemp "$BACKUP_DIR/ssh-effective.XXXXXX") || { restore_files; return 1; }
     # Match Host 匹配的是“客户端”主机名；默认 UseDNS no 时即客户端地址，不能传服务器自己的 hostname。
-    client_ip=${SSH_CONNECTION%% *}
     client_ip="${client_ip:-127.0.0.1}"
     if [[ -n "$admin_user" ]]; then
         ssh_effective -C "user=$admin_user,host=$client_ip,addr=$client_ip" > "$expected" || { restore_files; return 1; }
@@ -867,6 +932,13 @@ configure_ssh() {
     if [[ "$disable_root" == yes ]]; then
         ssh_effective -C "user=root,host=$client_ip,addr=$client_ip" > "$config" || { restore_files; return 1; }
         grep -qx 'permitrootlogin no' "$config" || { log_error 'root 的 Match 条件覆盖了加固项'; restore_files; return 1; }
+    fi
+    # AllowUsers 是累加的：别处（含 Match）再有 AllowUsers，名单内用户可绕过 IP 白名单。
+    if [[ -n "$allow_ips" ]]; then
+        effective_allow=$(awk '$1 == "allowusers" {print $2}' "$expected" | sort -u)
+        if [[ "$effective_allow" != "$(printf '*@%s\n' $allow_ips | sort -u)" ]]; then
+            log_error "最终 AllowUsers 与白名单不一致（其他配置也设置了 AllowUsers？）: ${effective_allow//$'\n'/ }"; restore_files; return 1
+        fi
     fi
     if [[ "$disable_password" == yes ]]; then
         for key in passwordauthentication kbdinteractiveauthentication; do
@@ -914,9 +986,9 @@ configure_ssh() {
     if [[ -n "$SSH_SOCKET" ]]; then
         # socket 模式下 sshd -T 的 port 不代表实际入口。
         printf '%s 监听: %s\n' "$SSH_SOCKET" "$(systemctl show -p Listen --value "$SSH_SOCKET" | sed 's/ (Stream)//' | paste -sd' ' -)"
-        ssh_effective | awk '$1 ~ /^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods)$/ {print}' || return 1
+        ssh_effective | awk '$1 ~ /^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|allowusers)$/ {print}' || return 1
     else
-        ssh_effective | awk '$1 ~ /^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods)$/ {print}' || return 1
+        ssh_effective | awk '$1 ~ /^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|allowusers)$/ {print}' || return 1
     fi
     log_warn '旧端口与规则未自动删除。请先在第二个终端测试新入口，再人工清理旧监听/规则及云安全组。'
     [[ -z "$new_port" ]] || printf '测试命令: ssh -o IdentitiesOnly=yes -p %s 用户名@服务器\n' "$new_port"
@@ -930,8 +1002,13 @@ wait_fail2ban() {
     log_error 'Fail2ban 服务或 sshd jail 未就绪'
     return 1
 }
+# 本脚本写入的 ignoreip 去掉固定的回环地址，只留用户输入的白名单。
+fail2ban_whitelist() {
+    [[ -f "$FAIL2BAN_CONFIG" ]] || return 0
+    awk '/^ignoreip[[:space:]]*=/ {sub(/^ignoreip[[:space:]]*=[[:space:]]*/, ""); for (i = 1; i <= NF; i++) if ($i != "127.0.0.1/8" && $i != "::1") printf "%s%s", (n++ ? " " : ""), $i} END {if (n) print ""}' "$FAIL2BAN_CONFIG"
+}
 install_fail2ban() {
-    local ports temp bantime=86400 findtime=600 maxretry=3 backend
+    local ports temp bantime=86400 findtime=600 maxretry=3 backend whitelist client_ip
     log_step '配置 Fail2ban'
     require_commands sshd ss || return 1
     command -v fail2ban-client >/dev/null 2>&1 || apt_install fail2ban || return 1
@@ -947,11 +1024,16 @@ install_fail2ban() {
         ask '最大失败次数: ' maxretry || return 1
         valid_uint "$maxretry" 1 1000 || { log_error '最大失败次数须为 1–1000 的整数'; return 1; }
     fi
+    # 白名单写入 sshd jail 的 ignoreip：这些来源登录失败不会被封禁，SSH 端口仍对所有 IP 开放。
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then read -r client_ip _ <<< "$SSH_CONNECTION"; log_info "当前 SSH 来源 IP: ${client_ip}"; fi
+    read_ip_list whitelist 'Fail2ban 白名单 IP/网段（不会被封禁）' "$(fail2ban_whitelist)" '不添加' || return 1
     start_change || return 1
     mkdir -p "$(dirname "$FAIL2BAN_CONFIG")" && backup_file "$FAIL2BAN_CONFIG" || return 1
     temp=$(mktemp "$BACKUP_DIR/fail2ban.XXXXXX") || return 1
     { printf '[sshd]\nenabled = true\nport = %s\nbackend = %s\nbantime = %s\nfindtime = %s\nmaxretry = %s\n' "$ports" "$backend" "$bantime" "$findtime" "$maxretry"
-      [[ "$backend" != auto ]] || printf 'logpath = /var/log/auth.log\n'; } > "$temp" || return 1
+      [[ "$backend" != auto ]] || printf 'logpath = /var/log/auth.log\n'
+      # jail 内的 ignoreip 会覆盖默认值，需带上回环地址。
+      [[ -z "$whitelist" ]] || printf 'ignoreip = 127.0.0.1/8 ::1 %s\n' "$whitelist"; } > "$temp" || return 1
     if ! atomic_write "$FAIL2BAN_CONFIG" "$temp" || ! fail2ban-client -t; then restore_files; return 1; fi
     if ! systemctl enable --now fail2ban || ! systemctl restart fail2ban || ! wait_fail2ban; then
         restore_files || log_error 'Fail2ban 配置回滚失败'
@@ -1221,7 +1303,7 @@ menu_status() {
         configure_ssh)
             ports=$(ssh_entry_ports 2>/dev/null | paste -sd, -)
             if [[ -f "$SSH_MANAGED" ]] && grep -qxF "$SSH_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
-                status_ok "已加固 · 端口 ${ports:-?}"
+                status_ok "已加固 · 端口 ${ports:-?}$(grep -q '^AllowUsers ' "$SSH_MANAGED" 2>/dev/null && printf ' · IP 白名单')"
             else
                 status_off "未加固 · 端口 ${ports:-?}"
             fi ;;
