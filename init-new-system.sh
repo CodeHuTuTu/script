@@ -622,7 +622,7 @@ configure_swap() {
         *) log_error '选择无效'; return 1 ;;
     esac
 }
-# 白名单项（SSH AllowUsers / Fail2ban ignoreip）：IPv4/IPv6 地址或 CIDR 网段。
+# 白名单项（UFW SSH 来源 / Fail2ban ignoreip）：IPv4/IPv6 地址或 CIDR 网段。
 valid_ip_or_cidr() {
     local addr="${1%%/*}" max octet
     if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
@@ -633,7 +633,8 @@ valid_ip_or_cidr() {
     else
         return 1
     fi
-    [[ "$1" != */* ]] || valid_uint "${1#*/}" 0 "$max"
+    # /0 等于对所有地址放行，不作为白名单项。
+    [[ "$1" != */* ]] || valid_uint "${1#*/}" 1 "$max"
 }
 # 读取空格/逗号分隔的 IP 列表写入变量 $1：留空保留当前值 $3，- 清空；$4 为当前无值时留空的含义。
 read_ip_list() {
@@ -666,10 +667,19 @@ ip_in_list() {
     done
     return 1
 }
-# 本脚本写入的 AllowUsers 只含 *@地址 形式。
-ssh_whitelist() {
-    [[ -f "$SSH_MANAGED" ]] || return 0
-    awk '$1 == "AllowUsers" {for (i = 2; i <= NF; i++) {sub(/^\*@/, "", $i); printf "%s%s", (n++ ? " " : ""), $i}} END {if (n) print ""}' "$SSH_MANAGED"
+# 白名单不含当前 SSH 来源时拒绝继续；IPv6 网段无法自动判断，需人工确认。
+check_whitelist_client() {
+    local client_ip=${SSH_CONNECTION%% *}
+    log_warn '启用后白名单外的 IP 将无法连接 SSH；动态 IP 变化后只能通过控制台恢复。'
+    if [[ -z "$client_ip" ]]; then
+        confirm '未检测到当前 SSH 来源，确认控制台可用且白名单包含你的出口 IP？'
+    elif ! ip_in_list "$client_ip" "$1"; then
+        if [[ "$client_ip" == *:* ]]; then
+            confirm "无法自动判断 IPv6 ${client_ip} 是否在白名单网段内，确认已包含？"
+        else
+            log_error "当前来源 ${client_ip} 不在白名单内，继续会把自己锁在外面"; return 1
+        fi
+    fi
 }
 # socket 激活或 ssh.service 未运行时 /run/sshd 可能不存在，sshd -t/-T 会报 Missing privilege separation directory。
 prepare_sshd() { [[ -d /run/sshd ]] || install -d -m 0755 /run/sshd; }
@@ -705,16 +715,67 @@ ssh_entry_ports() {
 }
 port_is_listening() { ss -H -ltn | awk -v port="$1" '{p=$4; sub(/^.*:/,"",p); if(p == port) found=1} END {exit !found}'; }
 ufw_active() { command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status | grep -x 'Status: active' >/dev/null; }
+# 本脚本的 SSH 白名单规则带 'SSH whitelist' 注释；ufw show added 在 UFW 未启用时也能列出。输出“来源 端口”。
+ufw_ssh_whitelist_rules() {
+    command -v ufw >/dev/null 2>&1 || return 0
+    LC_ALL=C ufw show added 2>/dev/null | awk '/comment .SSH whitelist./ {ip = ""; port = ""; for (i = 1; i < NF; i++) {if ($i == "from") ip = $(i + 1); if ($i == "port") port = $(i + 1)} if (ip != "" && port != "") print ip, port}'
+}
+# 与 ufw 存储规则时一致：去掉 /32、/128，网段取网络地址，IPv6 用压缩写法。ufw 依赖 python3。
+normalize_ips() {
+    (( $# )) || return 0
+    python3 -c 'import ipaddress, sys
+for a in sys.argv[1:]:
+    n = ipaddress.ip_network(a, strict=False)
+    print(n.network_address if n.prefixlen == n.max_prefixlen else n)' "$@" | awk '!seen[$0]++' | paste -sd' ' -
+}
+ufw_ssh_whitelist() { ufw_ssh_whitelist_rules | awk '!seen[$1]++ {print $1}' | paste -sd' ' -; }
+# 白名单为空时对所有来源放行，否则只放行白名单来源。
+ufw_allow_ssh_port() {
+    local ip
+    valid_port "$1" || return 1
+    if [[ -z "$2" ]]; then ufw allow "$1/tcp" comment SSH; return; fi
+    for ip in $2; do ufw allow from "$ip" to any port "$1" proto tcp comment 'SSH whitelist' || return 1; done
+}
+# 先加后删，避免切换间隙断开。只删除 SSH 端口的“任意来源”规则和本脚本加的白名单规则。
+ufw_sync_ssh_rules() {
+    local ports=$1 ips=$2 port ip
+    for port in $ports; do ufw_allow_ssh_port "$port" "$ips" || return 1; done
+    while read -r ip port; do
+        [[ -n "$ip" ]] || continue
+        if [[ " $ips " == *" $(normalize_ips "$ip") "* ]] && grep -qxF "$port" <<< "$ports"; then continue; fi
+        ufw delete allow from "$ip" to any port "$port" proto tcp || return 1
+    done < <(ufw_ssh_whitelist_rules)
+    [[ -n "$ips" ]] || return 0
+    for port in $ports; do
+        if LC_ALL=C ufw show added | grep -qE "^ufw allow $port/tcp( |\$)"; then ufw delete allow "$port/tcp" || return 1; fi
+    done
+    # 其他形式的规则（如 OpenSSH 应用、不带协议的端口）仍会对所有来源放行，只提示不删除。
+    for port in $ports; do
+        LC_ALL=C ufw show added | grep -vF "SSH whitelist" | grep -E "^ufw (allow|limit)" | grep -E "( |^)($port(/tcp)?|port $port)( |\$)|OpenSSH" | while read -r rule; do
+            log_warn "以下规则仍对所有来源开放 SSH，请人工确认: $rule"
+        done
+    done
+}
 configure_ufw() {
-    local ports port custom
+    local ports custom allow_ips
     log_step '配置 UFW'
     require_commands sshd ss || return 1
     ports=$(ssh_entry_ports) || return 1
     if ! command -v ufw >/dev/null 2>&1; then apt_install ufw || return 1; fi
-    log_warn '不会删除已有规则；Docker 发布端口和云安全组必须另外核查。'
+    log_warn '除 SSH 端口的放行规则外不会删除已有规则；Docker 发布端口和云安全组必须另外核查。'
+    if [[ -f "$SSH_MANAGED" ]] && grep -q '^AllowUsers ' "$SSH_MANAGED"; then
+        log_warn "${SSH_MANAGED} 中有旧版写入的 AllowUsers 白名单，请重新运行 SSH 安全配置移除，避免与 UFW 白名单不一致"
+    fi
     log_info "将保留配置/当前连接的 SSH 端口: ${ports//$'\n'/,}"
+    [[ -z "${SSH_CONNECTION:-}" ]] || log_info "当前 SSH 来源 IP: ${SSH_CONNECTION%% *}"
+    read_ip_list allow_ips '仅允许以下 IP/网段访问 SSH 端口' "$(ufw_ssh_whitelist)" '对所有 IP 开放' || return 1
+    if [[ -n "$allow_ips" ]]; then
+        # 白名单项已校验，不含空白和通配符。
+        allow_ips=$(normalize_ips $allow_ips) && [[ -n "$allow_ips" ]] || { log_error '白名单地址规范化失败'; return 1; }
+        check_whitelist_client "$allow_ips" || return 1
+    fi
     confirm '确认设置默认拒绝入站、允许出站并放行上述 SSH 端口？' || return 0
-    for port in $ports; do valid_port "$port" && ufw allow "$port/tcp" comment SSH || return 1; done
+    ufw_sync_ssh_rules "$ports" "$allow_ips" || return 1
     ufw default deny incoming && ufw default allow outgoing || return 1
     if confirm '开放 HTTP/HTTPS？'; then ufw allow 80/tcp && ufw allow 443/tcp || return 1; fi
     while true; do
@@ -844,7 +905,7 @@ rollback_ssh() {
 }
 configure_ssh() {
     local new_port old_ports ports port admin_user='' disable_root=no disable_password=no extra=no
-    local temp main_clean expected config actual key attempt listener type root_shell client_ip allow_ips effective_allow
+    local temp main_clean expected config actual key attempt listener type root_shell client_ip
     local socket_tokens=()
     log_step 'SSH 安全配置（端口迁移保留旧入口）'
     require_commands sshd ss ssh-keygen || return 1
@@ -870,22 +931,6 @@ configure_ssh() {
         confirm '确认已在第二个终端用公钥登录此用户并成功执行 sudo -i，且控制台可用？' || return 0
     fi
     if confirm '禁用空密码/X11，并设置 MaxAuthTries=3？'; then extra=yes; fi
-    # AllowUsers *@地址：白名单外的来源无论哪个用户都无法通过认证。
-    client_ip=${SSH_CONNECTION%% *}
-    [[ -z "$client_ip" ]] || log_info "当前 SSH 来源 IP: ${client_ip}"
-    read_ip_list allow_ips '仅允许以下 IP/网段登录 SSH' "$(ssh_whitelist)" '不限制' || return 1
-    if [[ -n "$allow_ips" ]]; then
-        log_warn '启用后白名单外的 IP 将无法登录；动态 IP 变化后只能通过控制台恢复。'
-        if [[ -z "$client_ip" ]]; then
-            confirm '未检测到当前 SSH 来源，确认控制台可用且白名单包含你的出口 IP？' || return 0
-        elif ! ip_in_list "$client_ip" "$allow_ips"; then
-            if [[ "$client_ip" == *:* ]]; then
-                confirm "无法自动判断 IPv6 ${client_ip} 是否在白名单网段内，确认已包含？" || return 0
-            else
-                log_error "当前来源 ${client_ip} 不在白名单内，继续会把自己锁在外面"; return 1
-            fi
-        fi
-    fi
     if [[ -n "$new_port" && ! -f "$FAIL2BAN_CONFIG" ]] && command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
         log_warn '现有 Fail2ban jail 不由本脚本管理，无法安全自动修改。'
         confirm '确认将人工同步已有 jail 到新端口？否则请先运行本脚本的 Fail2ban 配置' || return 0
@@ -906,9 +951,9 @@ configure_ssh() {
     ports="$old_ports"
     if [[ -n "$new_port" ]]; then ports=$(printf '%s\n%s\n' "$old_ports" "$new_port" | sort -nu) || return 1; fi
     config=$(mktemp "$BACKUP_DIR/ssh-desired.XXXXXX") || return 1
+    # AllowUsers 是旧版写入的 IP 白名单，已改由 UFW 实现，重新配置时清除。
     awk '!/^[[:space:]]*(Port|AllowUsers)[[:space:]]/' "$temp" > "$config" || return 1
     for port in $ports; do printf 'Port %s\n' "$port" >> "$config" || return 1; done
-    if [[ -n "$allow_ips" ]]; then printf 'AllowUsers %s\n' "$(printf '*@%s\n' $allow_ips | paste -sd' ' -)" >> "$config" || return 1; fi
     # 新选择的单值配置必须放在专属文件最前面。
     : > "$temp" || return 1
     if [[ "$disable_root" == yes ]]; then printf 'PermitRootLogin no\n' >> "$temp" || return 1; fi
@@ -922,6 +967,7 @@ configure_ssh() {
     if ! sshd -t -f "$SSH_CONFIG"; then restore_files; return 1; fi
     expected=$(mktemp "$BACKUP_DIR/ssh-effective.XXXXXX") || { restore_files; return 1; }
     # Match Host 匹配的是“客户端”主机名；默认 UseDNS no 时即客户端地址，不能传服务器自己的 hostname。
+    client_ip=${SSH_CONNECTION%% *}
     client_ip="${client_ip:-127.0.0.1}"
     if [[ -n "$admin_user" ]]; then
         ssh_effective -C "user=$admin_user,host=$client_ip,addr=$client_ip" > "$expected" || { restore_files; return 1; }
@@ -932,13 +978,6 @@ configure_ssh() {
     if [[ "$disable_root" == yes ]]; then
         ssh_effective -C "user=root,host=$client_ip,addr=$client_ip" > "$config" || { restore_files; return 1; }
         grep -qx 'permitrootlogin no' "$config" || { log_error 'root 的 Match 条件覆盖了加固项'; restore_files; return 1; }
-    fi
-    # AllowUsers 是累加的：别处（含 Match）再有 AllowUsers，名单内用户可绕过 IP 白名单。
-    if [[ -n "$allow_ips" ]]; then
-        effective_allow=$(awk '$1 == "allowusers" {print $2}' "$expected" | sort -u)
-        if [[ "$effective_allow" != "$(printf '*@%s\n' $allow_ips | sort -u)" ]]; then
-            log_error "最终 AllowUsers 与白名单不一致（其他配置也设置了 AllowUsers？）: ${effective_allow//$'\n'/ }"; restore_files; return 1
-        fi
     fi
     if [[ "$disable_password" == yes ]]; then
         for key in passwordauthentication kbdinteractiveauthentication; do
@@ -973,7 +1012,7 @@ configure_ssh() {
     fi
     # 放行失败就回滚配置；绝不删旧规则。回滚保留新 allow 是刻意的安全选择。
     if [[ -n "$new_port" ]] && ufw_active; then
-        ufw allow "$new_port/tcp" comment SSH || { restore_files; return 1; }
+        ufw_allow_ssh_port "$new_port" "$(ufw_ssh_whitelist)" || { restore_files; return 1; }
     fi
     if ! reload_ssh; then rollback_ssh; return 1; fi
     if [[ -n "$new_port" ]]; then
@@ -986,9 +1025,9 @@ configure_ssh() {
     if [[ -n "$SSH_SOCKET" ]]; then
         # socket 模式下 sshd -T 的 port 不代表实际入口。
         printf '%s 监听: %s\n' "$SSH_SOCKET" "$(systemctl show -p Listen --value "$SSH_SOCKET" | sed 's/ (Stream)//' | paste -sd' ' -)"
-        ssh_effective | awk '$1 ~ /^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|allowusers)$/ {print}' || return 1
+        ssh_effective | awk '$1 ~ /^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods)$/ {print}' || return 1
     else
-        ssh_effective | awk '$1 ~ /^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|allowusers)$/ {print}' || return 1
+        ssh_effective | awk '$1 ~ /^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods)$/ {print}' || return 1
     fi
     log_warn '旧端口与规则未自动删除。请先在第二个终端测试新入口，再人工清理旧监听/规则及云安全组。'
     [[ -z "$new_port" ]] || printf '测试命令: ssh -o IdentitiesOnly=yes -p %s 用户名@服务器\n' "$new_port"
@@ -1303,13 +1342,13 @@ menu_status() {
         configure_ssh)
             ports=$(ssh_entry_ports 2>/dev/null | paste -sd, -)
             if [[ -f "$SSH_MANAGED" ]] && grep -qxF "$SSH_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
-                status_ok "已加固 · 端口 ${ports:-?}$(grep -q '^AllowUsers ' "$SSH_MANAGED" 2>/dev/null && printf ' · IP 白名单')"
+                status_ok "已加固 · 端口 ${ports:-?}"
             else
                 status_off "未加固 · 端口 ${ports:-?}"
             fi ;;
         configure_ufw)
             if ! command -v ufw >/dev/null 2>&1; then status_off '未安装'
-            elif ufw_active; then status_ok '已启用'
+            elif ufw_active; then status_ok "已启用$([[ -z "$(ufw_ssh_whitelist)" ]] || printf ' · SSH 白名单')"
             else status_warn '未启用'; fi ;;
         install_fail2ban)
             if ! command -v fail2ban-client >/dev/null 2>&1; then status_off '未安装'
