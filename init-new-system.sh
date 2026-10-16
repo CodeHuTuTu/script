@@ -77,7 +77,17 @@ log_info() { printf '%s[INFO]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 log_warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 log_error() { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 log_step() { printf '\n%s==== %s ====%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
-ask() { IFS= read -r -p "$1" "$2" || { log_warn '输入结束，取消当前操作'; return 1; }; }
+# 终端上用 readline（read -e）：^H 和 ^? 都按删除处理，方向键可编辑。
+# 提示中的颜色码要用 \001/\002 包住，否则 readline 把它算进宽度，光标错位。
+ask() {
+    local prompt=$1
+    if [[ -t 0 ]]; then
+        prompt=$(printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m/\001&\002/g')
+        IFS= read -e -r -p "$prompt" "$2" || { log_warn '输入结束，取消当前操作'; return 1; }
+    else
+        IFS= read -r -p "$prompt" "$2" || { log_warn '输入结束，取消当前操作'; return 1; }
+    fi
+}
 confirm() {
     local response prompt="$1" default="${2:-n}"
     [[ "$default" == y ]] && prompt+=' [Y/n]: ' || prompt+=' [y/N]: '
@@ -622,36 +632,57 @@ configure_swap() {
         *) log_error '选择无效'; return 1 ;;
     esac
 }
-# 白名单项（UFW SSH 来源 / Fail2ban ignoreip）：IPv4/IPv6 地址或 CIDR 网段。
-valid_ip_or_cidr() {
-    local addr="${1%%/*}" max octet
-    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
-        max=32
-        for octet in "${BASH_REMATCH[@]:1:4}"; do (( 10#$octet <= 255 )) || return 1; done
-    elif [[ "$addr" == *:* && "$addr" =~ ^[0-9A-Fa-f:]+$ ]]; then
+# 白名单项（UFW SSH 来源 / Fail2ban ignoreip）：IPv4/IPv6 地址或 CIDR 网段。有问题时输出原因并返回 1。
+ip_entry_problem() {
+    local addr="${1%%/*}" max=32 octet parts=()
+    if [[ "$addr" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+        IFS=. read -r -a parts <<< "$addr"
+        for octet in "${parts[@]}"; do
+            (( ${#octet} <= 3 && 10#$octet <= 255 )) || { echo "每段数字须在 0–255 之间（${octet} 超出范围）"; return 1; }
+        done
+    elif [[ "$addr" == *:* ]]; then
         max=128
+        # ufw 与 Fail2ban 都依赖 python3，借用 ipaddress 做严格校验。
+        if ! [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || { command -v python3 >/dev/null 2>&1 && ! python3 -c 'import ipaddress, sys; ipaddress.IPv6Address(sys.argv[1])' "$addr" 2>/dev/null; }; then
+            echo 'IPv6 地址格式不正确，如 2001:db8::1'; return 1
+        fi
+    elif [[ "$addr" =~ ^[0-9.]+$ ]]; then
+        echo 'IPv4 须为 4 段数字，如 1.2.3.4'; return 1
     else
-        return 1
+        echo '不是 IP 地址（不支持域名）'; return 1
     fi
+    [[ "$1" == */* ]] || return 0
+    if ! [[ "${1#*/}" =~ ^[0-9]{1,3}$ ]]; then echo '网段掩码须为数字，如 1.2.3.0/24'; return 1; fi
     # /0 等于对所有地址放行，不作为白名单项。
-    [[ "$1" != */* ]] || valid_uint "${1#*/}" 1 "$max"
+    if (( 10#${1#*/} == 0 )); then echo '/0 表示所有地址；不想限制请直接留空'; return 1; fi
+    if (( 10#${1#*/} > max )); then echo "掩码位数须在 1–${max} 之间"; return 1; fi
 }
-# 读取空格/逗号分隔的 IP 列表写入变量 $1：留空保留当前值 $3，- 清空；$4 为当前无值时留空的含义。
+valid_ip_or_cidr() { ip_entry_problem "$1" >/dev/null; }
+# 读取空格/逗号分隔的 IP 列表写入变量 $1：留空保留当前值 $3，- 清空；$4 为当前无值时留空的含义。格式有误时提示后重新输入。
 read_ip_list() {
-    local input entry list entries=()
-    if [[ -n "$3" ]]; then
-        ask "$2（空格或逗号分隔；留空保留 $3，- 清空）: " input || return 1
-    else
-        ask "$2（空格或逗号分隔，留空$4）: " input || return 1
-    fi
-    list=$3
-    if [[ "$input" == - ]]; then
-        list=''
-    elif [[ -n "$input" ]]; then
-        read -r -a entries <<< "${input//,/ }"
-        for entry in "${entries[@]}"; do valid_ip_or_cidr "$entry" || { log_error "无效的 IP/网段: $entry"; return 1; }; done
-        list=$(printf '%s\n' "${entries[@]}" | awk '!seen[$0]++' | paste -sd' ' -)
-    fi
+    local input entry list problem bad entries=()
+    while true; do
+        if [[ -n "$3" ]]; then
+            ask "$2（空格或逗号分隔；留空保留 $3，- 清空）: " input || return 1
+        else
+            ask "$2（空格或逗号分隔，留空$4）: " input || return 1
+        fi
+        list=$3
+        [[ -n "$input" ]] || break
+        if [[ "$input" == - ]]; then list=''; break; fi
+        # 中文逗号、顿号也当作分隔符。
+        input=${input//[,，、;；]/ }
+        read -r -a entries <<< "$input"
+        bad=no
+        for entry in "${entries[@]}"; do
+            problem=$(ip_entry_problem "$entry") || { log_warn "“${entry}” 无效：${problem}"; bad=yes; }
+        done
+        if [[ "$bad" == no ]]; then
+            list=$(printf '%s\n' "${entries[@]}" | awk '!seen[$0]++' | paste -sd' ' -)
+            break
+        fi
+        log_info '示例：1.2.3.4、1.2.3.0/24、2001:db8::1；请重新输入'
+    done
     printf -v "$1" '%s' "$list"
 }
 ipv4_int() { local IFS=. a b c d; read -r a b c d <<< "$1"; printf '%d\n' $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d )); }
@@ -667,18 +698,25 @@ ip_in_list() {
     done
     return 1
 }
-# 白名单不含当前 SSH 来源时拒绝继续；IPv6 网段无法自动判断，需人工确认。
+# 白名单（变量名 $1）不含当前 SSH 来源时询问是否加入；拒绝加入则需再次确认，返回 1 表示用户取消。
+# IPv6 只能精确比对，在白名单网段内也会询问。
 check_whitelist_client() {
-    local client_ip=${SSH_CONNECTION%% *}
+    local client_ip=${SSH_CONNECTION%% *} state
     log_warn '启用后白名单外的 IP 将无法连接 SSH；动态 IP 变化后只能通过控制台恢复。'
     if [[ -z "$client_ip" ]]; then
-        confirm '未检测到当前 SSH 来源，确认控制台可用且白名单包含你的出口 IP？'
-    elif ! ip_in_list "$client_ip" "$1"; then
-        if [[ "$client_ip" == *:* ]]; then
-            confirm "无法自动判断 IPv6 ${client_ip} 是否在白名单网段内，确认已包含？"
-        else
-            log_error "当前来源 ${client_ip} 不在白名单内，继续会把自己锁在外面"; return 1
-        fi
+        confirm '未检测到当前 SSH 来源，确认控制台可用且白名单包含你的出口 IP？'; return
+    fi
+    ip_in_list "$client_ip" "${!1}" && return 0
+    if [[ "$client_ip" == *:* ]]; then state='未直接列在白名单中'; else state='不在白名单内'; fi
+    if valid_ip_or_cidr "$client_ip" && confirm "当前来源 ${client_ip} ${state}，是否加入？" y; then
+        printf -v "$1" '%s' "$(normalize_ips ${!1} "$client_ip")"
+        log_info "已加入白名单: ${client_ip}"
+        return 0
+    fi
+    if [[ "$client_ip" == *:* ]]; then
+        confirm "无法自动判断 IPv6 ${client_ip} 是否在白名单网段内，确认已包含？"
+    else
+        confirm "不加入的话，当前会话断开后 ${client_ip} 将无法再连接，仍然继续？"
     fi
 }
 # socket 激活或 ssh.service 未运行时 /run/sshd 可能不存在，sshd -t/-T 会报 Missing privilege separation directory。
@@ -772,7 +810,8 @@ configure_ufw() {
     if [[ -n "$allow_ips" ]]; then
         # 白名单项已校验，不含空白和通配符。
         allow_ips=$(normalize_ips $allow_ips) && [[ -n "$allow_ips" ]] || { log_error '白名单地址规范化失败'; return 1; }
-        check_whitelist_client "$allow_ips" || return 1
+        check_whitelist_client allow_ips || { log_info '已取消'; return 0; }
+        log_info "SSH 白名单: ${allow_ips}"
     fi
     confirm '确认设置默认拒绝入站、允许出站并放行上述 SSH 端口？' || return 0
     ufw_sync_ssh_rules "$ports" "$allow_ips" || return 1
