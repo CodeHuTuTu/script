@@ -1,16 +1,27 @@
 #!/bin/bash
 # Debian/Ubuntu 系统初始化。必须使用 Bash；source 默认只加载函数，不执行安装。
-# 在当前 Bash 中刷新环境：source ./init-new-system.sh --refresh-env
+# 运行菜单，退出后自动刷新当前终端的别名/EDITOR：source ./init-new-system.sh --run
+# 仅刷新当前终端：source ./init-new-system.sh --refresh-env
 
-# 必须在父 Bash 中 source 才能更新当前终端；禁用别名时先清除旧定义。
-if [[ "${BASH_SOURCE[0]}" != "$0" && "${1:-}" == --refresh-env ]]; then
+# 子进程无法修改父 Bash，必须由父 Bash source 本段才能更新当前终端；禁用别名时先清除旧定义。
+if [[ "${BASH_SOURCE[0]}" != "$0" && ( "${1:-}" == --run || "${1:-}" == --refresh-env ) ]]; then
+    if [[ "$1" == --run ]]; then
+        # 菜单在独立的 bash 子进程中运行（不污染当前 Shell）；仅当 Bash 配置实际变化时才重新加载。
+        __ps_before=$(cksum /etc/bash.bashrc "$HOME/.bashrc" 2>/dev/null)
+        if (( EUID == 0 )); then bash "${BASH_SOURCE[0]}" --auto-refresh; else sudo bash "${BASH_SOURCE[0]}" --auto-refresh; fi
+        __ps_rc=$?
+        if [[ "$(cksum /etc/bash.bashrc "$HOME/.bashrc" 2>/dev/null)" == "$__ps_before" ]]; then
+            unset __ps_before; set -- "$__ps_rc"; unset __ps_rc; return "$1"
+        fi
+        unset __ps_before
+    fi
     unalias ll la l ls grep egrep fgrep df free du rm cp mv .. ... .... mkdir wget path now ports 2>/dev/null || true
     # shellcheck disable=SC1091
     if [[ -r /etc/bash.bashrc ]]; then source /etc/bash.bashrc || return 1; fi
     # shellcheck disable=SC1091
     if [[ -r "$HOME/.bashrc" ]]; then source "$HOME/.bashrc" || return 1; fi
     printf '%s\n' '当前 Bash 的别名和环境变量已重新加载。'
-    return 0
+    set -- "${__ps_rc:-0}"; unset __ps_rc; return "$1"
 fi
 
 SYSTEMD_UNIT_ROOT=/etc/systemd/system
@@ -40,8 +51,18 @@ SSH_END='# END properties-script ssh include'
 UFW_AFTER_RULES=/etc/ufw/after.rules
 UFW_DOCKER_BEGIN='# BEGIN properties-script ufw-docker'
 UFW_DOCKER_END='# END properties-script ufw-docker'
+FSTAB=/etc/fstab
+SWAP_FILE=/swapfile
+SWAP_SYSCTL=/etc/sysctl.d/90-properties-script-swap.conf
+SWAP_BEGIN='# BEGIN properties-script swap'
+SWAP_END='# END properties-script swap'
+# swap 文件最小值，以及创建后根分区至少保留的可用空间（MiB）。
+SWAP_MIN_MIB=128
+SWAP_RESERVE_MIB=1024
 # 本次运行改过别名/EDITOR 时记录范围，退出菜单时再次提示刷新父终端。
 ENV_REFRESH_SCOPE=
+# 由 source --run 启动时为 yes：父 Bash 会在退出后自动刷新，无需提示手动命令。
+AUTO_REFRESH=no
 MANAGED_ALIAS_NAMES='ll la l ls grep egrep fgrep df free du rm cp mv .. ... .... mkdir wget path now ports'
 # 与 optimize-vps.sh 共用同一把锁；放在仅 root 可写的 /run，避免 /run/lock 中的符号链接攻击。
 LOCK_FILE=/run/properties-script.lock
@@ -425,6 +446,157 @@ configure_timezone() {
     [[ "$timezone" != "$current" ]] || { log_info "保持当前时区 ${current}"; return 0; }
     confirm "设置时区为 ${timezone}？" y || return 0
     timedatectl set-timezone "$timezone"
+}
+# /proc/swaps 列：Filename Type Size Used Priority（单位 KiB）。
+swap_active() { awk -v f="$1" 'NR > 1 && $1 == f {found=1} END {exit !found}' /proc/swaps 2>/dev/null; }
+swap_managed() { [[ -f "$FSTAB" ]] && grep -qxF "$SWAP_BEGIN" "$FSTAB"; }
+fmt_mib() { awk -v m="$1" 'BEGIN {if (m >= 1024) printf "%.1fG", m / 1024; else printf "%dM", m}'; }
+# 1024 / 1024M / 2G → MiB
+parse_size_mib() {
+    [[ "$1" =~ ^([0-9]{1,7})([MmGg]?)$ ]] || return 1
+    if [[ "${BASH_REMATCH[2],,}" == g ]]; then printf '%d\n' $(( 10#${BASH_REMATCH[1]} * 1024 )); else printf '%d\n' $(( 10#${BASH_REMATCH[1]} )); fi
+}
+# swapoff 要把该 swap 中的页全部换回内存；可用内存不足时会触发 OOM，先检查并留 128MiB 余量。
+swap_can_disable() {
+    local used avail
+    swap_active "$1" || return 0
+    used=$(awk -v f="$1" 'NR > 1 && $1 == f {print $4}' /proc/swaps)
+    avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    valid_uint "$used" 0 4294967295 && valid_uint "$avail" 0 4294967295 || { log_error '无法读取 swap 用量或可用内存'; return 1; }
+    (( 10#$used + 131072 <= 10#$avail )) || { log_error "$1 已使用 $(( 10#$used / 1024 ))MiB，可用内存 $(( 10#$avail / 1024 ))MiB 不足以安全停用；请先释放内存"; return 1; }
+}
+write_swap_fstab() {
+    local temp
+    temp=$(mktemp "$BACKUP_DIR/fstab.XXXXXX") || return 1
+    if [[ "$1" == add ]]; then
+        printf '%s none swap sw 0 0\n' "$SWAP_FILE" > "$temp" && update_block "$FSTAB" "$SWAP_BEGIN" "$SWAP_END" "$temp" || return 1
+    else
+        backup_file "$FSTAB" || return 1
+        strip_block "$FSTAB" "$SWAP_BEGIN" "$SWAP_END" "$temp" || { log_error "配置区块不完整: $FSTAB"; return 1; }
+        atomic_write "$FSTAB" "$temp" "$(stat -c %a -- "$FSTAB")" || return 1
+    fi
+    # fstab 中的 swap 由 systemd-fstab-generator 生成 .swap 单元，需重新生成。
+    systemctl daemon-reload
+}
+create_swap_file() {
+    # noclobber 保证新建而不是写入已存在的文件/链接；swap 可能含内存中的敏感数据，先收紧权限再分配空间。
+    ( umask 077; set -C; : > "$SWAP_FILE" ) || return 1
+    # fallocate 在 ext4/xfs 上生成无空洞文件；失败时退回 dd 逐块写零（较慢）。
+    if ! fallocate -l "${1}MiB" -- "$SWAP_FILE" 2>/dev/null; then
+        log_warn 'fallocate 失败，改用 dd 写零（较慢）'
+        dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$1" conv=fsync status=progress || return 1
+    fi
+    mkswap -- "$SWAP_FILE" >/dev/null && swapon -- "$SWAP_FILE"
+}
+setup_swap_file() {
+    local fs dir mem current=0 avail max default input size recreate=yes current_swappiness swappiness others temp
+    dir=$(dirname "$SWAP_FILE")
+    fs=$(stat -f -c %T -- "$dir") || return 1
+    # stat 对 ext4 也显示 ext2/ext3。btrfs 需禁用 CoW/压缩，不在此自动处理。
+    case "$fs" in
+        ext2/ext3|xfs) ;;
+        btrfs) log_error 'btrfs 上的 swap 文件需禁用 CoW（可用 btrfs filesystem mkswapfile），本脚本不自动处理'; return 1 ;;
+        *) log_error "不支持在 ${fs} 文件系统上自动创建 swap 文件"; return 1 ;;
+    esac
+    mem=$(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo)
+    valid_uint "$mem" 1 2147483647 || { log_error '无法读取物理内存容量'; return 1; }
+    [[ ! -f "$SWAP_FILE" ]] || current=$(( $(stat -c %s -- "$SWAP_FILE") / 1048576 ))
+    avail=$(df -P -m -- "$dir" | awk 'NR == 2 {print $4}')
+    valid_uint "$avail" 0 2147483647 || { log_error '无法读取磁盘可用空间'; return 1; }
+    # 调整大小时旧文件会先删除，其空间计入可用。
+    max=$(( 10#$avail + current - SWAP_RESERVE_MIB ))
+    (( max >= SWAP_MIN_MIB )) || { log_error "磁盘可用 ${avail}MiB，保留 ${SWAP_RESERVE_MIB}MiB 后不足以创建 swap"; return 1; }
+    # 推荐值：内存 <2G 取 2 倍，2–8G 与内存相同，≥8G 取 4G（不考虑休眠）；按 256MiB 向上取整，受磁盘上限约束。
+    if (( mem < 2048 )); then default=$(( mem * 2 )); elif (( mem < 8192 )); then default=$mem; else default=4096; fi
+    default=$(( (default + 255) / 256 * 256 ))
+    (( default <= max )) || default=$(( max / 256 * 256 ))
+    (( default >= SWAP_MIN_MIB )) || default=$max
+    log_info "物理内存 ${mem}MiB；${dir} 可用 ${avail}MiB，可分配上限 ${max}MiB（保留 ${SWAP_RESERVE_MIB}MiB）"
+    ask "swap 大小（如 1024M、2G）[${default}M]: " input || return 1
+    size=$(parse_size_mib "${input:-${default}M}") || { log_error '格式无效，示例：1024M、2G'; return 1; }
+    (( size >= SWAP_MIN_MIB && size <= max )) || { log_error "大小须在 ${SWAP_MIN_MIB}–${max}MiB 之间"; return 1; }
+    if (( current == size )) && swap_active "$SWAP_FILE"; then recreate=no; log_info "${SWAP_FILE} 已是 ${size}MiB 且已启用，不重建"; fi
+    [[ "$recreate" == no ]] || swap_can_disable "$SWAP_FILE" || return 1
+    current_swappiness=$(sysctl -n vm.swappiness) || return 1
+    log_info 'vm.swappiness 越低越倾向把页留在内存；把 swap 当作防 OOM 兜底时常用 10'
+    ask "vm.swappiness（0–100）[${current_swappiness}]: " swappiness || return 1
+    swappiness="${swappiness:-$current_swappiness}"
+    valid_uint "$swappiness" 0 100 || { log_error 'vm.swappiness 须为 0–100 的整数'; return 1; }
+    swappiness=$((10#$swappiness))
+    [[ "$recreate" == yes || "$swappiness" != "$current_swappiness" ]] || { log_info '没有需要变更的内容'; return 0; }
+    if [[ "$recreate" == yes ]]; then
+        if (( current > 0 )); then printf 'swap 文件: %s %sMiB -> %sMiB（先停用并删除旧文件）\n' "$SWAP_FILE" "$current" "$size"
+        else printf 'swap 文件: %s 新建 %sMiB，写入 %s\n' "$SWAP_FILE" "$size" "$FSTAB"; fi
+    fi
+    [[ "$swappiness" == "$current_swappiness" ]] || printf 'vm.swappiness: %s -> %s（%s）\n' "$current_swappiness" "$swappiness" "$SWAP_SYSCTL"
+    confirm '确认执行？' || return 0
+    # 停用→删除→创建→写 fstab 期间忽略中断/断线；由 main/run_all 在步骤返回后恢复。
+    trap '' HUP INT TERM
+    start_change || return 1
+    if [[ "$swappiness" != "$current_swappiness" ]]; then
+        others=$(grep -lsE '^[[:space:]]*vm[./]swappiness[[:space:]]*=' /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf | grep -vxF "$SWAP_SYSCTL")
+        [[ -z "$others" ]] || log_warn "以下文件也设置了 vm.swappiness，重启后可能覆盖本设置: ${others//$'\n'/, }"
+        mkdir -p "$(dirname "$SWAP_SYSCTL")" && backup_file "$SWAP_SYSCTL" || return 1
+        temp=$(mktemp "$BACKUP_DIR/swap-sysctl.XXXXXX") || return 1
+        printf '# Managed by properties-script\nvm.swappiness = %s\n' "$swappiness" > "$temp" || return 1
+        if ! atomic_write "$SWAP_SYSCTL" "$temp" || ! sysctl -q -w "vm.swappiness=$swappiness"; then
+            restore_files; sysctl -q -w "vm.swappiness=$current_swappiness"; return 1
+        fi
+    fi
+    if [[ "$recreate" == yes ]]; then
+        if swap_active "$SWAP_FILE"; then swapoff -- "$SWAP_FILE" || return 1; fi
+        rm -f -- "$SWAP_FILE" || return 1
+        if ! create_swap_file "$size" || ! write_swap_fstab add; then
+            log_error 'swap 创建失败，清理半成品并移除 fstab 中本脚本的条目'
+            if swap_active "$SWAP_FILE"; then swapoff -- "$SWAP_FILE"; fi
+            rm -f -- "$SWAP_FILE"
+            write_swap_fstab remove || log_error "请人工检查 ${FSTAB}，备份: $BACKUP_DIR"
+            return 1
+        fi
+    fi
+    swapon --show
+    log_info "swap 配置完成；备份: $BACKUP_DIR"
+}
+remove_swap_file() {
+    swap_managed || { log_info '本脚本未创建过 swap，无需删除'; return 0; }
+    swap_can_disable "$SWAP_FILE" || return 1
+    confirm "确认停用并删除 ${SWAP_FILE}？" || return 0
+    trap '' HUP INT TERM
+    start_change || return 1
+    if swap_active "$SWAP_FILE"; then swapoff -- "$SWAP_FILE" || return 1; fi
+    if ! write_swap_fstab remove; then
+        log_error "更新 ${FSTAB} 失败，重新启用 swap"
+        restore_files && systemctl daemon-reload; swapon -- "$SWAP_FILE"
+        return 1
+    fi
+    rm -f -- "$SWAP_FILE" || return 1
+    log_info "已删除；备份: $BACKUP_DIR"
+    [[ ! -f "$SWAP_SYSCTL" ]] || log_info "vm.swappiness 设置（${SWAP_SYSCTL}）保留；没有 swap 时不起作用"
+}
+configure_swap() {
+    local action
+    log_step '虚拟内存（swap 文件）'
+    require_commands mkswap swapon swapoff fallocate df sysctl || return 1
+    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet; then
+        log_error '检测到容器（如 OpenVZ/LXC），swap 由宿主机分配，无法在容器内创建'; return 1
+    fi
+    [[ -r /proc/swaps ]] || { log_error '内核未提供 /proc/swaps'; return 1; }
+    if awk 'NR > 1 {found=1} END {exit !found}' /proc/swaps; then swapon --show; else log_info '当前没有启用的 swap'; fi
+    printf 'vm.swappiness = %s\n' "$(sysctl -n vm.swappiness)"
+    if [[ -L "$SWAP_FILE" || ( -e "$SWAP_FILE" && ! -f "$SWAP_FILE" ) ]]; then log_error "$SWAP_FILE 不是普通文件"; return 1; fi
+    if [[ -e "$SWAP_FILE" ]] && ! swap_managed; then
+        log_error "$SWAP_FILE 已存在但不由本脚本管理；请先人工 swapoff 并删除它及 fstab 条目"; return 1
+    fi
+    if [[ -f "$FSTAB" ]] && awk -v b="$SWAP_BEGIN" -v e="$SWAP_END" -v f="$SWAP_FILE" '$0 == b {i=1; next} $0 == e {i=0; next} !i && $1 == f {found=1} END {exit !found}' "$FSTAB"; then
+        log_error "$FSTAB 中已有非本脚本管理的 $SWAP_FILE 条目，请先人工处理"; return 1
+    fi
+    ask '1=创建/调整大小，2=删除本脚本创建的 swap，0=返回: ' action || return 1
+    case "$action" in
+        0) return 0 ;;
+        1) setup_swap_file ;;
+        2) remove_swap_file ;;
+        *) log_error '选择无效'; return 1 ;;
+    esac
 }
 # socket 激活或 ssh.service 未运行时 /run/sshd 可能不存在，sshd -t/-T 会报 Missing privilege separation directory。
 prepare_sshd() { [[ -d /run/sshd ]] || install -d -m 0755 /run/sshd; }
@@ -889,10 +1061,12 @@ report_alias_overrides() {
 }
 print_environment_refresh() {
     local scope="$1"
+    if [[ "$AUTO_REFRESH" == yes ]]; then log_info '退出菜单后将自动刷新当前终端的别名/EDITOR'; return 0; fi
     log_warn '别名/EDITOR 已写入配置；子进程不能修改当前父终端。请在需要刷新的原 Bash 终端执行：'
     printf '  unalias %s 2>/dev/null || true; source /etc/bash.bashrc; source ~/.bashrc\n' "$MANAGED_ALIAS_NAMES"
     if [[ "$scope" != 1 ]]; then log_info '请以被配置的目标用户执行上述命令，不要在 sudo 子进程中 source 用户配置。'; fi
     log_info '也可在原 Bash 中执行：source /路径/init-new-system.sh --refresh-env'
+    log_info '下次可用 source /路径/init-new-system.sh --run 启动，退出后自动刷新'
 }
 configure_user_environment() {
     local scope user_input username home bashrc vimrc owner action edit_vim edit_editor temp vim_path
@@ -989,9 +1163,12 @@ pad_label() {
 }
 normal_users() { getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ {print $1}'; }
 menu_status() {
-    local missing=0 cmd names ports banned username home
+    local missing=0 cmd names ports banned username home total
     case "$1" in
         update_system) [[ ! -f /var/run/reboot-required ]] || status_warn '待重启' ;;
+        configure_swap)
+            total=$(awk 'NR > 1 {s += $3} END {printf "%d", s / 1024}' /proc/swaps 2>/dev/null)
+            if [[ "${total:-0}" == 0 ]]; then status_off '未启用'; else status_ok "$(fmt_mib "$total")"; fi ;;
         install_common_tools)
             for cmd in vim git curl htop tmux tree; do command -v "$cmd" >/dev/null 2>&1 || missing=$((missing + 1)); done
             if (( missing == 0 )); then status_ok '已安装'; else status_off "缺 ${missing} 项"; fi ;;
@@ -1039,8 +1216,8 @@ menu_status() {
     esac
 }
 # 编号即 run_all 的推荐执行顺序；修改时与 MENU_STEPS、run_all 保持一致。
-MENU_STEPS=(update_system install_common_tools configure_timezone install_docker create_user add_ssh_key configure_user_environment configure_ssh_motd configure_ssh configure_ufw install_fail2ban)
-MENU_LABELS=('更新系统' '常用工具' '时区' 'Docker' '创建用户' 'SSH 公钥' '别名 / 编辑器 / Vim' 'SSH 欢迎信息' 'SSH 加固 / 端口' 'UFW 防火墙' 'Fail2ban')
+MENU_STEPS=(update_system install_common_tools configure_timezone configure_swap install_docker create_user add_ssh_key configure_user_environment configure_ssh_motd configure_ssh configure_ufw install_fail2ban)
+MENU_LABELS=('更新系统' '常用工具' '时区' '虚拟内存 (swap)' 'Docker' '创建用户' 'SSH 公钥' '别名 / 编辑器 / Vim' 'SSH 欢迎信息' 'SSH 加固 / 端口' 'UFW 防火墙' 'Fail2ban')
 show_menu() {
     local i os rule
     os=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-$ID}")
@@ -1051,8 +1228,8 @@ show_menu() {
     for i in "${!MENU_STEPS[@]}"; do
         case "$i" in
             0) printf '\n  %s系统%s\n' "$C_CYAN" "$C_RESET" ;;
-            4) printf '\n  %s用户%s\n' "$C_CYAN" "$C_RESET" ;;
-            8) printf '\n  %s安全%s\n' "$C_CYAN" "$C_RESET" ;;
+            5) printf '\n  %s用户%s\n' "$C_CYAN" "$C_RESET" ;;
+            9) printf '\n  %s安全%s\n' "$C_CYAN" "$C_RESET" ;;
         esac
         printf '   %s%2d%s  %s  %s\n' "$C_BOLD" $((i + 1)) "$C_RESET" "$(pad_label "${MENU_LABELS[$i]}" 20)" "$(menu_status "${MENU_STEPS[$i]}")"
     done
@@ -1063,8 +1240,9 @@ exit_menu() { [[ -z "$ENV_REFRESH_SCOPE" ]] || print_environment_refresh "$ENV_R
 main() {
     local choice step
     case "${1:-}" in
-        --help|-h) printf '%s\n' 'sudo bash init-new-system.sh' '当前终端刷新：source init-new-system.sh --refresh-env'; return 0 ;;
-        --refresh-env) log_error '必须在原 Bash 中 source 本脚本 --refresh-env，不能作为子进程执行'; return 1 ;;
+        --help|-h) printf '%s\n' 'sudo bash init-new-system.sh' '运行并在退出后自动刷新当前终端：source init-new-system.sh --run' '仅刷新当前终端：source init-new-system.sh --refresh-env'; return 0 ;;
+        --auto-refresh) AUTO_REFRESH=yes ;;
+        --refresh-env|--run) log_error "必须在原 Bash 中 source 本脚本 $1，不能作为子进程执行"; return 1 ;;
         '') ;;
         *) log_error '未知参数'; return 1 ;;
     esac
